@@ -2,14 +2,29 @@
 # Generado por AgentKit
 
 import os
+import re
 import json
 import yaml
 import secrets
 import logging
 import aiomysql
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("agentkit")
+
+# Zona horaria del negocio (Huajuapan de León, Oaxaca). Oaxaca ya no observa
+# horario de verano, así que un offset fijo UTC-6 es correcto; usamos ZoneInfo
+# si está disponible (Linux/prod) y caemos al offset fijo si no (Windows sin tzdata).
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo("America/Mexico_City")
+except Exception:
+    _TZ = timezone(timedelta(hours=-6))
+
+
+def _ahora_local() -> datetime:
+    """Hora actual en la zona horaria del negocio (México)."""
+    return datetime.now(_TZ)
 
 
 def _db_config() -> dict:
@@ -138,32 +153,150 @@ def cargar_info_negocio() -> dict:
         return {}
 
 
-def obtener_horario() -> dict:
-    """Retorna el horario de atención y si el negocio está abierto ahora."""
-    ahora = datetime.now()
-    dia = ahora.weekday()   # 0=Lunes … 6=Domingo
-    hora = ahora.hour
-    minuto = ahora.minute
+# ── Horario de atención (configurable desde la tabla configs) ──────────────
 
-    # "12:00 AM" = medianoche = hora 0:00 del día siguiente.
-    # El negocio cierra EN medianoche, así que el último minuto válido es 23:59.
-    # hora == 0 ya es el nuevo día → cerrado.
+_DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
-    # Lunes a Sábado (0-5): 4:00 PM – 12:00 AM (medianoche)
-    if dia <= 5:
-        esta_abierto = hora >= 16  # 16:00 hasta 23:59 inclusive
-        horario = "Lunes a Sábado 4:00 PM – 12:00 AM"
-    # Domingo (6): 1:00 PM – 12:00 AM (medianoche)
+# Horario por defecto (fallback si configs['business_hours'] no tiene ese día).
+# Minutos desde medianoche; 24:00 = 1440 = cierre en medianoche. None = cerrado.
+_HORARIO_DEFAULT = {
+    0: (16 * 60, 24 * 60),  # Lunes
+    1: (16 * 60, 24 * 60),  # Martes
+    2: (16 * 60, 24 * 60),  # Miércoles
+    3: (16 * 60, 24 * 60),  # Jueves
+    4: (16 * 60, 24 * 60),  # Viernes
+    5: (16 * 60, 24 * 60),  # Sábado
+    6: (13 * 60, 24 * 60),  # Domingo
+}
+
+
+def _quitar_acentos(texto: str) -> str:
+    return texto.translate(str.maketrans("áéíóúüÁÉÍÓÚÜ", "aeiouuAEIOUU"))
+
+
+def _weekday_de_nombre(nombre: str) -> int | None:
+    """Mapea 'Lunes'..'Domingo' (con o sin acento, cualquier caso) a 0..6."""
+    objetivo = _quitar_acentos(nombre).strip().lower()
+    for i, d in enumerate(_DIAS):
+        if _quitar_acentos(d).lower() == objetivo:
+            return i
+    return None
+
+
+def _fmt_minutos(m: int) -> str:
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+async def _obtener_horario_semana() -> dict:
+    """
+    Horario por día: weekday -> (apertura, cierre) en minutos, o None si cerrado.
+    Parte del default y aplica los overrides de configs['business_hours'], cuyos
+    valores son del estilo 'Lunes [16:00-24:00]' o 'Viernes [NOT_WORKING]'.
+    """
+    horario = dict(_HORARIO_DEFAULT)
+    for value in await obtener_catalogo_config("business_hours"):
+        m = re.match(r"\s*([A-Za-zÁÉÍÓÚáéíóúüÜñÑ]+)\s*\[\s*(.+?)\s*\]", value or "")
+        if not m:
+            logger.warning(f"business_hours con formato inválido (ignorado): {value!r}")
+            continue
+        weekday = _weekday_de_nombre(m.group(1))
+        if weekday is None:
+            logger.warning(f"business_hours con día no reconocido (ignorado): {value!r}")
+            continue
+        cuerpo = m.group(2).strip()
+        if cuerpo.upper() == "NOT_WORKING":
+            horario[weekday] = None
+            continue
+        rango = re.match(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", cuerpo)
+        if not rango:
+            logger.warning(f"business_hours con rango inválido (ignorado): {value!r}")
+            continue
+        apertura = int(rango.group(1)) * 60 + int(rango.group(2))
+        cierre = int(rango.group(3)) * 60 + int(rango.group(4))
+        horario[weekday] = (apertura, cierre)
+    return horario
+
+
+async def _obtener_fechas_cerradas() -> set:
+    """
+    Fechas cerradas (feriados/días inhábiles) desde configs['business_closed_dates'],
+    valores con una fecha 'YYYY-MM-DD' (admite etiqueta extra, ej. '2026-12-25 [Navidad]').
+    Sin filas => set vacío => abierto todos los días del año.
+    """
+    fechas = set()
+    for value in await obtener_catalogo_config("business_closed_dates"):
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", value or "")
+        if not m:
+            logger.warning(f"business_closed_dates con fecha inválida (ignorado): {value!r}")
+            continue
+        try:
+            fechas.add(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date())
+        except ValueError:
+            logger.warning(f"business_closed_dates con fecha inexistente (ignorado): {value!r}")
+    return fechas
+
+
+async def obtener_horario() -> dict:
+    """
+    Estado de atención AHORA (hora de México), configurable desde la tabla configs:
+      - configs['business_hours']: override del horario semanal. Sin filas => default.
+      - configs['business_closed_dates']: cierres por fecha (prioridad sobre el horario).
+    Retorna: horario (texto), esta_abierto, hora_actual, dia_actual.
+    """
+    ahora = _ahora_local()
+    dia = ahora.weekday()
+    minutos = ahora.hour * 60 + ahora.minute
+
+    # 1) Cierre por fecha (feriado) — tiene prioridad sobre el horario semanal
+    if ahora.date() in await _obtener_fechas_cerradas():
+        return {
+            "horario": f"Cerrado hoy ({ahora.strftime('%d/%m/%Y')}) por día inhábil",
+            "esta_abierto": False,
+            "hora_actual": ahora.strftime("%I:%M %p"),
+            "dia_actual": _DIAS[dia],
+        }
+
+    # 2) Horario del día (override de configs o default)
+    semana = await _obtener_horario_semana()
+    rango = semana.get(dia, _HORARIO_DEFAULT[dia])
+
+    if rango is None:
+        esta_abierto = False
+        horario_str = f"{_DIAS[dia]}: cerrado"
     else:
-        esta_abierto = hora >= 13  # 13:00 hasta 23:59 inclusive
-        horario = "Domingos 1:00 PM – 12:00 AM"
+        apertura, cierre = rango
+        esta_abierto = apertura <= minutos < cierre
+        horario_str = f"{_DIAS[dia]} {_fmt_minutos(apertura)}–{_fmt_minutos(cierre)}"
 
     return {
-        "horario": horario,
+        "horario": horario_str,
         "esta_abierto": esta_abierto,
         "hora_actual": ahora.strftime("%I:%M %p"),
-        "dia_actual": ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"][dia],
+        "dia_actual": _DIAS[dia],
     }
+
+
+async def obtener_horario_semanal_texto() -> str:
+    """
+    Horario semanal vigente en texto (default + overrides de configs), para inyectar
+    al prompt. Incluye las próximas fechas cerradas si hay alguna configurada.
+    """
+    semana = await _obtener_horario_semana()
+    lineas = []
+    for i, nombre in enumerate(_DIAS):
+        rango = semana.get(i)
+        if rango is None:
+            lineas.append(f"- {nombre}: cerrado")
+        else:
+            apertura, cierre = rango
+            lineas.append(f"- {nombre}: {_fmt_minutos(apertura)}–{_fmt_minutos(cierre)}")
+    texto = "\n".join(lineas)
+
+    hoy = _ahora_local().date()
+    futuras = sorted(f for f in await _obtener_fechas_cerradas() if f >= hoy)
+    if futuras:
+        texto += "\nDías cerrados próximos: " + ", ".join(f.strftime("%d/%m/%Y") for f in futuras)
+    return texto
 
 
 def buscar_en_knowledge(consulta: str) -> str:
@@ -373,6 +506,17 @@ async def registrar_pedido(
     """
     if not items:
         return {"ok": False, "error": "El pedido no tiene productos."}
+
+    # Red de seguridad: no registrar pedidos fuera del horario de atención
+    horario = await obtener_horario()
+    if not horario["esta_abierto"]:
+        return {
+            "ok": False,
+            "error": (
+                f"En este momento el negocio está cerrado ({horario['horario']}). "
+                "No se puede registrar el pedido; invita al cliente a escribir en horario de atención."
+            ),
+        }
 
     # type: 2 = domicilio, 3 = pasa a recoger
     tipo_venta = 3 if tipo_entrega == "recoger" else 2

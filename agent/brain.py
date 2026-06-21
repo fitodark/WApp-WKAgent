@@ -9,6 +9,7 @@ from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from agent.tools import (
     obtener_horario,
+    obtener_horario_semanal_texto,
     obtener_menu_desde_db,
     registrar_pedido,
     obtener_telefono_sucursal,
@@ -161,8 +162,12 @@ async def generar_respuesta(mensaje: str, historial: list[dict], cliente: dict |
     telefono = await obtener_telefono_sucursal()
     system_prompt = system_prompt.replace("[TELÉFONO_SUCURSAL]", telefono)
 
+    # Inyectar el horario semanal vigente (desde configs) para que Claude no use horarios de memoria
+    horario_semanal = await obtener_horario_semanal_texto()
+    system_prompt += f"\n\n## Horario de atención (vigente)\n{horario_semanal}"
+
     # Inyectar hora actual y estado abierto/cerrado para que Claude no adivine
-    horario = obtener_horario()
+    horario = await obtener_horario()
     estado = "ABIERTO" if horario["esta_abierto"] else "CERRADO"
     system_prompt += (
         f"\n\n## Estado actual del negocio"
