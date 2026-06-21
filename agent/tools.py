@@ -74,16 +74,17 @@ async def obtener_menu_desde_db() -> str:
     """
     Obtiene el menú activo (active=1, type in 1,2,3) y lo formatea para el system prompt.
 
-    Marca cada producto según delivery_available (tinyint(1), default 0):
-      - delivery_available = 1 → disponible para domicilio Y local
-      - delivery_available = 0 → solo consumo en el local
-        (incluye TODAS las bebidas alcohólicas, que nunca se envían a domicilio)
+    Marca cada producto según promotion_type (clasificación de canal del POS,
+    catálogo configs 'products_promotion_type', mantenido desde el POS Laravel):
+      - promotion_type = 2 (Domicilio) → disponible para domicilio Y local
+      - promotion_type = 1 (General)   → solo consumo en el local
+        (incluye TODAS las bebidas alcohólicas y los combos/promos)
     """
     try:
         conn = await aiomysql.connect(**_db_config())
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
-                "SELECT id, name, detail, price, type, delivery_available FROM products "
+                "SELECT id, name, detail, price, type, promotion_type FROM products "
                 "WHERE active = 1 AND type IN (1, 2, 3) "
                 "ORDER BY type, id"
             )
@@ -103,7 +104,7 @@ async def obtener_menu_desde_db() -> str:
                 nombre = p["name"]
                 detalle = p["detail"] if p["detail"] and p["detail"].strip() not in _DETALLE_VACIO else ""
                 precio = float(p["price"])
-                disponible_domicilio = p.get("delivery_available") == 1
+                disponible_domicilio = p.get("promotion_type") == 2
                 etiqueta = "🚗 domicilio+local" if disponible_domicilio else "🏠 SOLO EN LOCAL"
                 precio_fmt = f"${precio:.2f}".rstrip("0").rstrip(".")
                 lineas.append(
@@ -230,37 +231,6 @@ def formatear_pedido(items: list[dict], es_domicilio: bool = False) -> str:
         lineas.append("🚗 Envío sin costo")
 
     return "\n".join(lineas)
-
-
-def obtener_promociones_vigentes() -> str:
-    """Retorna las promociones vigentes según el día de la semana."""
-    dia = datetime.now().weekday()  # 0=Lunes, 6=Domingo
-    nombres_dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    dia_nombre = nombres_dias[dia]
-
-    promos = []
-
-    if dia == 1:  # Martes
-        promos.append("🍔 *Promo Martes:* Hamburguesas 2x$150")
-    if dia == 2:  # Miércoles
-        promos.append("🍗 *Promo Miércoles Alitas:*")
-        promos.append("  • 8 boneless $76 | 10 boneless $95")
-        promos.append("  • 15 boneless $142.50 | 20 boneless $190")
-        promos.append("  • 30 boneless $285 | 8 pz alitas $76")
-        promos.append("  • 25 pz $225 | 50 pz $475")
-        promos.append("  • Litros de cócteles 50% desc: $45")
-    if dia == 4:  # Viernes
-        promos.append("🍺 *Promo Viernes:* Cervezas 3x2 — $180")
-
-    # Promociones permanentes
-    promos.append("🍺 *Siempre:* Tarro chico barril 2x1 — $30")
-    promos.append("🍺 *Siempre:* Promo Megas (3 Megas) — $220")
-    promos.append("🍺 *Siempre:* Cubeta de Medias — $210")
-
-    if not promos:
-        return f"Hoy ({dia_nombre}) no hay promociones especiales, pero siempre tenemos precios accesibles 🍗"
-
-    return f"🔥 *Promociones de hoy ({dia_nombre}):*\n" + "\n".join(promos)
 
 
 # ════════════════════════════════════════════════════════════
@@ -423,14 +393,40 @@ async def registrar_pedido(
                 return {"ok": False, "error": "No se especificaron productos válidos."}
             placeholders = ",".join(["%s"] * len(ids))
             await cur.execute(
-                f"SELECT id, price, type FROM products WHERE id IN ({placeholders}) AND active = 1",
+                f"SELECT id, name, price, type, promotion_type FROM products "
+                f"WHERE id IN ({placeholders}) AND active = 1",
                 ids,
             )
-            info = {int(r["id"]): {"price": float(r["price"]), "type": r["type"]} for r in await cur.fetchall()}
+            info = {
+                int(r["id"]): {
+                    "name": r["name"],
+                    "price": float(r["price"]),
+                    "type": r["type"],
+                    "promotion_type": r["promotion_type"],
+                }
+                for r in await cur.fetchall()
+            }
 
             faltantes = sorted({i for i in ids if i not in info})
             if faltantes:
                 return {"ok": False, "error": f"Productos no encontrados o inactivos: {faltantes}"}
+
+            # Red de seguridad: los productos SOLO EN LOCAL (promotion_type != 2, incluye
+            # toda bebida alcohólica y los combos/promos) no pueden salir del establecimiento —
+            # ni a domicilio ni para recoger/llevar. Solo se venden para consumo en el local.
+            if tipo_venta in (2, 3):
+                solo_local = sorted({
+                    info[i]["name"] for i in ids if info[i]["promotion_type"] != 2
+                })
+                if solo_local:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "Estos productos son solo para consumo dentro del local y NO se "
+                            f"pueden enviar a domicilio ni entregar para llevar: {', '.join(solo_local)}. "
+                            "Ofrece alternativas que sí estén disponibles para llevar."
+                        ),
+                    }
 
             # 2) Calcular totales y armar las líneas (con desglose de sabores si es type 2)
             lineas = []
