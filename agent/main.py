@@ -4,7 +4,7 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 
@@ -59,13 +59,20 @@ async def webhook_verificacion(request: Request):
 @app.post("/webhook")
 async def webhook_handler(request: Request):
     """
-    Recibe mensajes de WhatsApp via Whapi.cloud.
-    Procesa el mensaje, genera respuesta con Claude y la envía de vuelta.
+    Recibe mensajes de WhatsApp via el proveedor configurado.
+
+    SIEMPRE responde 200: los errores se aíslan por mensaje y se registran en el log.
+    Devolver 500 haría que el proveedor (p.ej. OpenWA) reintente y reprocese el mismo
+    mensaje, así que nunca propagamos la excepción al webhook.
     """
     try:
         mensajes = await proveedor.parsear_webhook(request)
+    except Exception as e:
+        logger.error(f"No se pudo parsear el webhook: {e}")
+        return {"status": "ok"}
 
-        for msg in mensajes:
+    for msg in mensajes:
+        try:
             if msg.es_propio or not msg.texto:
                 continue
 
@@ -97,12 +104,15 @@ async def webhook_handler(request: Request):
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
             # Enviar respuesta por WhatsApp
-            await proveedor.enviar_mensaje(msg.telefono, respuesta)
+            enviado = await proveedor.enviar_mensaje(msg.telefono, respuesta)
+            if enviado:
+                logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
+            else:
+                logger.error(f"No se pudo enviar la respuesta a {msg.telefono}")
 
-            logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
+        except Exception as e:
+            # Un fallo en un mensaje no debe abortar el resto del lote ni gatillar reintentos
+            logger.error(f"Error procesando mensaje {getattr(msg, 'mensaje_id', '?')}: {e}")
+            continue
 
-        return {"status": "ok"}
-
-    except Exception as e:
-        logger.error(f"Error en webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok"}
