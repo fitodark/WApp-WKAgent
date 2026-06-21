@@ -1,0 +1,26 @@
+# Configuración del negocio — Generado por AgentKit
+negocio:
+  nombre: "Wings Kings"
+  descripcion: >
+    Restaurante bar especializado en alitas preparadas en diferentes sabores,
+    desde dulces hasta extra picosas. También ofrece hamburguesas, dedos de queso,
+    snacks para compartir, cerveza de barril (tarro y jarra), cervezas nacionales
+    (Victoria, Corona, Modelo), y coctelería preparada (azulitos, mojitos, micheladas, etc.).
+    Los productos se venden para consumo en el local y también a domicilio,
+    con cobertura exclusiva en Huajuapan de León, Oaxaca.
+  horario: "Lunes a Sábado de 4:00 PM a 12:00 AM, Domingos de 1:00 PM a 12:00 AM"
+  ciudad: "Huajuapan de León, Oaxaca"
+
+agente:
+  nombre: "Wings Kings Agent"
+  tono: "Amigable y casual"
+  casos_de_uso:
+    - "Tomar pedidos vía WhatsApp"
+    - "Informar menú y precios"
+    - "Recomendaciones personalizadas basadas en historial del cliente"
+    - "Informar sobre promociones vigentes"
+    - "Gestionar pedidos a domicilio"
+
+metadata:
+  creado: "2026-04-18"
+  version: "1.0"
