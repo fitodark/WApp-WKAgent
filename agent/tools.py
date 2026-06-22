@@ -207,7 +207,8 @@ async def _obtener_horario_semana() -> dict:
         if cuerpo.upper() == "NOT_WORKING":
             horario[weekday] = None
             continue
-        rango = re.match(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", cuerpo)
+        # Separador tolerante: guion (-, –, —) y/o espacios. Acepta "16:00-24:00" y "16:00 24:00".
+        rango = re.match(r"(\d{1,2}):(\d{2})\s*[-–—]?\s*(\d{1,2}):(\d{2})", cuerpo)
         if not rango:
             logger.warning(f"business_hours con rango inválido (ignorado): {value!r}")
             continue
