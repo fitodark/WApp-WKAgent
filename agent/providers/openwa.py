@@ -47,7 +47,7 @@ class ProveedorOpenWA(ProveedorWhatsApp):
             numero = data.get("senderPhone") or await self._resolver_numero(chat_id)
         else:
             numero = chat_id
-        logger.info(f"[OpenWA] chat={chat_id} numero_real={numero or '(no resuelto)'}")
+        logger.debug(f"[OpenWA] chat={chat_id} numero_real={numero or '(no resuelto)'}")
 
         return [MensajeEntrante(
             telefono=chat_id,
@@ -66,7 +66,7 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(url, headers={"X-API-Key": self.api_key})
-            logger.info(f"[OpenWA resolver] GET {url} -> {r.status_code} {r.text[:500]!r}")
+            logger.debug(f"[OpenWA resolver] GET {url} -> {r.status_code} {r.text[:500]!r}")
             if r.status_code == 200:
                 return self._numero_de_contacto(r.json())
         except Exception as e:
