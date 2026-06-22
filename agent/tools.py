@@ -38,6 +38,20 @@ def _db_config() -> dict:
     }
 
 
+async def _numeros_propios() -> set[str]:
+    """
+    Últimos 10 dígitos de los números PROPIOS del negocio (no son clientes).
+    Evita que, si la resolución del @lid falla y OpenWA devuelve el número del
+    establecimiento, una venta se cuelgue del cliente "Establecimiento".
+    """
+    propios = set()
+    for v in await obtener_catalogo_config("local_phone_number"):
+        d = "".join(filter(str.isdigit, v or ""))
+        if len(d) >= 10:
+            propios.add(d[-10:])
+    return propios
+
+
 async def buscar_cliente_por_telefono(telefono: str) -> dict | None:
     """
     Busca un cliente en la base de datos de Wings Kings por número de teléfono.
@@ -51,6 +65,10 @@ async def buscar_cliente_por_telefono(telefono: str) -> dict | None:
     # Normalizar: quedarse solo con los últimos 10 dígitos para comparar
     digitos = "".join(filter(str.isdigit, telefono))
     sufijo = digitos[-10:] if len(digitos) >= 10 else digitos
+
+    # Un número propio del negocio NUNCA es un cliente (no casar con "Establecimiento")
+    if not sufijo or sufijo in await _numeros_propios():
+        return None
 
     try:
         conn = await aiomysql.connect(**_db_config())
@@ -507,6 +525,10 @@ async def registrar_cliente(
     # Normalizar el teléfono al formato de 10 dígitos que usa el POS
     digitos = "".join(filter(str.isdigit, telefono))
     phone = digitos[-10:] if len(digitos) >= 10 else digitos
+
+    # No dar de alta con un número propio del negocio (resolución del @lid fallida)
+    if not phone or phone in await _numeros_propios():
+        return {"ok": False, "error": "No se pudo determinar un número válido del cliente para darlo de alta."}
 
     ahora = datetime.now()
     try:
