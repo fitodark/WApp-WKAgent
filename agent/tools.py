@@ -673,8 +673,9 @@ async def registrar_pedido(
                 "INSERT INTO ventas "
                 "(IdUsuario, client_id, montoTotal, montoTotalDescuento, montoSubtotal, "
                 " montoIva, cantidadRecibida, cantidadProductos, type, estatus, activo, "
-                " `order`, apply_discount, payment_type, direccion_envio, created_at, updated_at) "
-                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, 1, %s, %s, %s)",
+                " `order`, apply_discount, payment_type, venta_agente, direccion_envio, "
+                " created_at, updated_at) "
+                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, 1, 1, %s, %s, %s)",
                 (id_bot, client_id, monto_total, cantidad_recibida, cantidad_productos,
                  tipo_venta, (direccion.strip() if direccion else None), ahora, ahora),
             )
