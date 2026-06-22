@@ -666,26 +666,29 @@ async def registrar_pedido(
             monto_total = round(monto_total, 2)
             ahora = datetime.now()
 
-            # 3) Cabecera del pedido (estatus=1 → Pedido Abierto, visible en comandas)
+            # 3) Cabecera del pedido (estatus=1 → Pedido Abierto, visible en comandas).
+            # `order`=1: bandera que indica al POS que debe imprimir los tickets
+            # (cocina para alimentos, barra para bebidas).
             await cur.execute(
                 "INSERT INTO ventas "
                 "(IdUsuario, client_id, montoTotal, montoTotalDescuento, montoSubtotal, "
                 " montoIva, cantidadRecibida, cantidadProductos, type, estatus, activo, "
-                " apply_discount, payment_type, direccion_envio, created_at, updated_at) "
-                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 0, 1, %s, %s, %s)",
+                " `order`, apply_discount, payment_type, direccion_envio, created_at, updated_at) "
+                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, 1, %s, %s, %s)",
                 (id_bot, client_id, monto_total, cantidad_recibida, cantidad_productos,
                  tipo_venta, (direccion.strip() if direccion else None), ahora, ahora),
             )
             folio = int(cur.lastrowid)
 
-            # 4) Detalle del pedido (delete_flag=0 → línea vigente)
-            for orden, (pid, cant, subtotal, desc) in enumerate(lineas, start=1):
+            # 4) Detalle del pedido (delete_flag=0 → línea vigente; `order`=1 → misma
+            # bandera de impresión que la cabecera, para que el ticket salga en su lugar).
+            for (pid, cant, subtotal, desc) in lineas:
                 await cur.execute(
                     "INSERT INTO ventasproductos "
                     "(IdProducto, IdVenta, cantidad, montoVenta, descripcion, `order`, "
                     " estatus, delete_flag, id_user_create, created_at, updated_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 0, %s, %s, %s)",
-                    (pid, folio, cant, subtotal, desc, orden, id_bot, ahora, ahora),
+                    "VALUES (%s, %s, %s, %s, %s, 1, 1, 0, %s, %s, %s)",
+                    (pid, folio, cant, subtotal, desc, id_bot, ahora, ahora),
                 )
 
         await conn.commit()
