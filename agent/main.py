@@ -88,8 +88,10 @@ async def webhook_handler(request: Request):
                 logger.warning(f"Número bloqueado ignorado: {msg.telefono}")
                 continue
 
-            # Verificar si el cliente está registrado en Wings Kings
-            cliente = await buscar_cliente_por_telefono(msg.telefono)
+            # Verificar si el cliente está registrado en Wings Kings.
+            # Usamos el número real (msg.numero); si el proveedor no lo resolvió,
+            # caemos al chatId (válido cuando ya viene como número, no @lid).
+            cliente = await buscar_cliente_por_telefono(msg.numero or msg.telefono)
             if cliente:
                 logger.info(f"Cliente registrado: {cliente['name']}")
 

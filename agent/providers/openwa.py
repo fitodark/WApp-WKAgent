@@ -2,8 +2,8 @@
 # Generado por AgentKit
 
 import os
-import json
 import logging
+from urllib.parse import quote
 import httpx
 from fastapi import Request
 from agent.providers.base import ProveedorWhatsApp, MensajeEntrante
@@ -26,15 +26,8 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         evento = body.get("event")
         data = body.get("data", {}) or {}
         mensaje_id = data.get("id", "")
-        logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={data.get('from')} body={data.get('body')!r}")
-
-        # TEMPORAL (diagnóstico @lid): volcar el payload completo para ubicar el campo
-        # que trae el número de teléfono real cuando el chatId viene como @lid.
-        if evento == "message.received":
-            try:
-                logger.info(f"[OpenWA payload] {json.dumps(data, ensure_ascii=False, default=str)}")
-            except Exception as e:
-                logger.info(f"[OpenWA payload] no serializable: {e} — keys={list(data.keys())}")
+        chat_id = data.get("from", "")
+        logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={chat_id} body={data.get('body')!r}")
 
         # OpenWA emite varios eventos; solo procesamos mensajes entrantes
         if evento != "message.received":
@@ -47,12 +40,37 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         # En OpenWA el id arranca con "true_" cuando el mensaje lo envio el propio numero
         es_propio = mensaje_id.startswith("true_")
 
+        # Número real para buscar en clients. Si el chat viene como @lid (WhatsApp
+        # multi-device oculta el teléfono), lo resolvemos; si ya es @c.us, el chat_id
+        # mismo es el número. 'senderPhone' aparece si OpenWA corre con RESOLVE_LID_TO_PHONE=true.
+        if "@lid" in chat_id:
+            numero = data.get("senderPhone") or await self._resolver_numero(chat_id)
+        else:
+            numero = chat_id
+        logger.info(f"[OpenWA] chat={chat_id} numero_real={numero or '(no resuelto)'}")
+
         return [MensajeEntrante(
-            telefono=data.get("from", ""),
+            telefono=chat_id,
             texto=data.get("body", ""),
             mensaje_id=mensaje_id,
             es_propio=es_propio,
+            numero=numero or "",
         )]
+
+    async def _resolver_numero(self, contact_id: str) -> str:
+        """Resuelve un chatId @lid a su número real via la API de contactos de OpenWA."""
+        if not self.api_key:
+            return ""
+        url = f"{self.base_url}/api/sessions/{self.session_id}/contacts/{quote(contact_id, safe='')}/phone"
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, headers={"X-API-Key": self.api_key})
+            if r.status_code == 200:
+                return r.json().get("phone") or ""
+            logger.warning(f"resolver_numero {contact_id}: {r.status_code} — {r.text}")
+        except Exception as e:
+            logger.error(f"resolver_numero error para {contact_id}: {e}")
+        return ""
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
         """Envia un mensaje de texto via la API REST de OpenWA."""
