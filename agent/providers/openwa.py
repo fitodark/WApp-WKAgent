@@ -29,6 +29,10 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         chat_id = data.get("from", "")
         logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={chat_id} body={data.get('body')!r}")
 
+        # TEMPORAL (diagnóstico @lid): ver si llega 'senderPhone' tras RESOLVE_LID_TO_PHONE
+        if evento == "message.received":
+            logger.info(f"[OpenWA payload] keys={list(data.keys())} senderPhone={data.get('senderPhone')!r} data={data}")
+
         # OpenWA emite varios eventos; solo procesamos mensajes entrantes
         if evento != "message.received":
             return []
@@ -60,14 +64,15 @@ class ProveedorOpenWA(ProveedorWhatsApp):
     async def _resolver_numero(self, contact_id: str) -> str:
         """Resuelve un chatId @lid a su número real via la API de contactos de OpenWA."""
         if not self.api_key:
+            logger.warning("resolver_numero: OPENWA_API_KEY no configurado")
             return ""
         url = f"{self.base_url}/api/sessions/{self.session_id}/contacts/{quote(contact_id, safe='')}/phone"
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(url, headers={"X-API-Key": self.api_key})
+            logger.info(f"[OpenWA resolver] GET {url} -> {r.status_code} {r.text[:300]!r}")
             if r.status_code == 200:
                 return r.json().get("phone") or ""
-            logger.warning(f"resolver_numero {contact_id}: {r.status_code} — {r.text}")
         except Exception as e:
             logger.error(f"resolver_numero error para {contact_id}: {e}")
         return ""
