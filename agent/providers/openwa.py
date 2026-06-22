@@ -29,10 +29,6 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         chat_id = data.get("from", "")
         logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={chat_id} body={data.get('body')!r}")
 
-        # TEMPORAL (diagnóstico @lid): ver si llega 'senderPhone' tras RESOLVE_LID_TO_PHONE
-        if evento == "message.received":
-            logger.info(f"[OpenWA payload] keys={list(data.keys())} senderPhone={data.get('senderPhone')!r} data={data}")
-
         # OpenWA emite varios eventos; solo procesamos mensajes entrantes
         if evento != "message.received":
             return []
@@ -85,12 +81,8 @@ class ProveedorOpenWA(ProveedorWhatsApp):
             contacto = contacto["data"]
         if not isinstance(contacto, dict):
             return ""
-        # Campos directos más comunes
-        for clave in ("phone", "number", "phoneNumber", "pn"):
-            valor = contacto.get(clave)
-            if valor and any(c.isdigit() for c in str(valor)):
-                return "".join(c for c in str(valor) if c.isdigit())
-        # 'id' puede ser dict {_serialized, user, server} o string "<num>@c.us"
+        # 1) 'id' con formato @c.us trae el número REAL. OJO: en multi-device el campo
+        #    'number' puede traer el @lid (no el teléfono), por eso 'id' tiene prioridad.
         idv = contacto.get("id")
         serial = ""
         if isinstance(idv, dict):
@@ -99,6 +91,11 @@ class ProveedorOpenWA(ProveedorWhatsApp):
             serial = idv
         if "@c.us" in serial or "@s.whatsapp.net" in serial:
             return "".join(c for c in serial.split("@")[0] if c.isdigit())
+        # 2) Campos directos, solo si 'id' no resolvió a un @c.us
+        for clave in ("phone", "phoneNumber", "number", "pn"):
+            valor = contacto.get(clave)
+            if valor and any(c.isdigit() for c in str(valor)):
+                return "".join(c for c in str(valor) if c.isdigit())
         return ""
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
