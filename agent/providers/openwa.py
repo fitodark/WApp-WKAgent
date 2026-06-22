@@ -66,15 +66,39 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         if not self.api_key:
             logger.warning("resolver_numero: OPENWA_API_KEY no configurado")
             return ""
-        url = f"{self.base_url}/api/sessions/{self.session_id}/contacts/{quote(contact_id, safe='')}/phone"
+        url = f"{self.base_url}/api/sessions/{self.session_id}/contacts/{quote(contact_id, safe='')}"
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(url, headers={"X-API-Key": self.api_key})
-            logger.info(f"[OpenWA resolver] GET {url} -> {r.status_code} {r.text[:300]!r}")
+            logger.info(f"[OpenWA resolver] GET {url} -> {r.status_code} {r.text[:500]!r}")
             if r.status_code == 200:
-                return r.json().get("phone") or ""
+                return self._numero_de_contacto(r.json())
         except Exception as e:
             logger.error(f"resolver_numero error para {contact_id}: {e}")
+        return ""
+
+    @staticmethod
+    def _numero_de_contacto(contacto) -> str:
+        """Extrae el número (solo dígitos) de la respuesta del contacto de OpenWA."""
+        # La respuesta puede venir envuelta (ej. {"data": {...}})
+        if isinstance(contacto, dict) and isinstance(contacto.get("data"), dict):
+            contacto = contacto["data"]
+        if not isinstance(contacto, dict):
+            return ""
+        # Campos directos más comunes
+        for clave in ("phone", "number", "phoneNumber", "pn"):
+            valor = contacto.get(clave)
+            if valor and any(c.isdigit() for c in str(valor)):
+                return "".join(c for c in str(valor) if c.isdigit())
+        # 'id' puede ser dict {_serialized, user, server} o string "<num>@c.us"
+        idv = contacto.get("id")
+        serial = ""
+        if isinstance(idv, dict):
+            serial = idv.get("_serialized") or idv.get("user") or ""
+        elif isinstance(idv, str):
+            serial = idv
+        if "@c.us" in serial or "@s.whatsapp.net" in serial:
+            return "".join(c for c in serial.split("@")[0] if c.isdigit())
         return ""
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
