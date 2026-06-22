@@ -687,6 +687,34 @@ async def registrar_pedido(
 
             monto_total = round(monto_total, 2)
             ahora = datetime.now()
+            direccion_norm = direccion.strip() if direccion else None
+
+            # Idempotencia: evitar doble registro del MISMO pedido (p.ej. doble confirmación
+            # cuando el cliente reescribe). Si ya hay un pedido del agente idéntico (mismo
+            # total, cantidad, tipo y cliente/dirección) en los últimos 10 min, se reutiliza.
+            desde = ahora - timedelta(minutes=10)
+            if client_id is not None:
+                cond, extra = "client_id = %s", [client_id]
+            else:
+                cond, extra = "client_id IS NULL AND direccion_envio <=> %s", [direccion_norm]
+            await cur.execute(
+                "SELECT ventaId FROM ventas WHERE venta_agente = 1 AND estatus = 1 "
+                "AND type = %s AND montoTotal = %s AND cantidadProductos = %s "
+                "AND created_at >= %s AND " + cond + " ORDER BY ventaId DESC LIMIT 1",
+                [tipo_venta, monto_total, cantidad_productos, desde] + extra,
+            )
+            dup = await cur.fetchone()
+            if dup:
+                folio_dup = int(dup["ventaId"])
+                cambio_dup = round(float(cantidad_recibida) - monto_total, 2)
+                logger.warning(f"Pedido duplicado evitado — se reutiliza folio {folio_dup}")
+                return {
+                    "ok": True,
+                    "folio": folio_dup,
+                    "total": monto_total,
+                    "cambio": cambio_dup if cambio_dup > 0 else 0.0,
+                    "duplicado": True,
+                }
 
             # 3) Cabecera del pedido (estatus=1 → Pedido Abierto, visible en comandas).
             # `order`=1: bandera que indica al POS que debe imprimir los tickets
@@ -699,7 +727,7 @@ async def registrar_pedido(
                 " created_at, updated_at) "
                 "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, 1, 1, %s, %s, %s)",
                 (id_bot, client_id, monto_total, cantidad_recibida, cantidad_productos,
-                 tipo_venta, (direccion.strip() if direccion else None), ahora, ahora),
+                 tipo_venta, direccion_norm, ahora, ahora),
             )
             folio = int(cur.lastrowid)
 
