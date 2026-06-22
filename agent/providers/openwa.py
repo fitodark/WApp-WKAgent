@@ -2,6 +2,7 @@
 # Generado por AgentKit
 
 import os
+import json
 import logging
 import httpx
 from fastapi import Request
@@ -26,6 +27,14 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         data = body.get("data", {}) or {}
         mensaje_id = data.get("id", "")
         logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={data.get('from')} body={data.get('body')!r}")
+
+        # TEMPORAL (diagnóstico @lid): volcar el payload completo para ubicar el campo
+        # que trae el número de teléfono real cuando el chatId viene como @lid.
+        if evento == "message.received":
+            try:
+                logger.info(f"[OpenWA payload] {json.dumps(data, ensure_ascii=False, default=str)}")
+            except Exception as e:
+                logger.info(f"[OpenWA payload] no serializable: {e} — keys={list(data.keys())}")
 
         # OpenWA emite varios eventos; solo procesamos mensajes entrantes
         if evento != "message.received":
