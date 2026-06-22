@@ -478,12 +478,62 @@ async def obtener_id_usuario_bot() -> int:
         conn.close()
 
 
+async def registrar_cliente(
+    nombre: str,
+    direccion: str | None = None,
+    referencia: str | None = None,
+    telefono: str | None = None,
+) -> dict:
+    """
+    Da de alta un cliente NUEVO en la tabla clients, solo si su teléfono no existe.
+
+    Si el número ya está registrado NO duplica: devuelve el client_id existente.
+    El 'telefono' se inyecta del lado servidor (número real del remitente).
+
+    Returns:
+        {"ok": True, "client_id": int, "ya_existia": bool} o {"ok": False, "error": "..."}
+    """
+    if not nombre or not nombre.strip():
+        return {"ok": False, "error": "Falta el nombre completo del cliente."}
+    if not telefono:
+        return {"ok": False, "error": "No se pudo determinar el número del cliente."}
+
+    # No duplicar: si el número ya está registrado, devolver ese cliente
+    existente = await buscar_cliente_por_telefono(telefono)
+    if existente:
+        return {"ok": True, "client_id": int(existente["id"]), "ya_existia": True}
+
+    # Normalizar el teléfono al formato de 10 dígitos que usa el POS
+    digitos = "".join(filter(str.isdigit, telefono))
+    phone = digitos[-10:] if len(digitos) >= 10 else digitos
+
+    ahora = datetime.now()
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO clients (name, address, reference, phone, active, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, 1, %s, %s)",
+                (nombre.strip(), (direccion.strip() if direccion else None),
+                 (referencia.strip() if referencia else None), phone, ahora, ahora),
+            )
+            await conn.commit()
+            nuevo_id = int(cur.lastrowid)
+        conn.close()
+        logger.info(f"Cliente nuevo dado de alta id={nuevo_id} phone={phone}")
+        return {"ok": True, "client_id": nuevo_id, "ya_existia": False}
+    except Exception as e:
+        logger.error(f"Error al dar de alta cliente: {e}")
+        return {"ok": False, "error": "No se pudo dar de alta al cliente por un problema técnico."}
+
+
 async def registrar_pedido(
     items: list[dict],
     tipo_entrega: str,
     cantidad_recibida: float,
     client_id: int | None = None,
     direccion: str | None = None,
+    telefono: str | None = None,
 ) -> dict:
     """
     Inserta un pedido CONFIRMADO en ventas + ventasproductos y devuelve el folio.
@@ -497,8 +547,9 @@ async def registrar_pedido(
             'descripcion' es opcional (sabores/notas de esa línea).
         tipo_entrega: "domicilio" → ventas.type=2 | "recoger" → ventas.type=3
         cantidad_recibida: monto con el que paga el cliente (para calcular el cambio)
-        client_id: id del cliente en la tabla clients, o None si no está registrado
-        direccion: dirección de entrega (informativa)
+        client_id: id del cliente en clients, o None (se intenta resolver por teléfono)
+        direccion: dirección de entrega indicada en el chat; se guarda en ventas.direccion_envio
+        telefono: número real del remitente (se inyecta del lado servidor) para resolver client_id
 
     Returns:
         {"ok": True, "folio": int, "total": float, "cambio": float}
@@ -520,6 +571,16 @@ async def registrar_pedido(
 
     # type: 2 = domicilio, 3 = pasa a recoger
     tipo_venta = 3 if tipo_entrega == "recoger" else 2
+
+    # A domicilio la dirección es obligatoria (se guarda en el pedido para el ticket)
+    if tipo_venta == 2 and not (direccion and direccion.strip()):
+        return {"ok": False, "error": "Falta la dirección de entrega para el pedido a domicilio."}
+
+    # Resolver el cliente por teléfono si no llegó client_id (p.ej. recién dado de alta)
+    if client_id is None and telefono:
+        encontrado = await buscar_cliente_por_telefono(telefono)
+        if encontrado:
+            client_id = encontrado["id"]
 
     # El usuario del POS bajo el que queda registrado el pedido
     id_bot = await obtener_id_usuario_bot()
@@ -609,10 +670,10 @@ async def registrar_pedido(
                 "INSERT INTO ventas "
                 "(IdUsuario, client_id, montoTotal, montoTotalDescuento, montoSubtotal, "
                 " montoIva, cantidadRecibida, cantidadProductos, type, estatus, activo, "
-                " apply_discount, payment_type, created_at, updated_at) "
-                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 0, 1, %s, %s)",
+                " apply_discount, payment_type, direccion_envio, created_at, updated_at) "
+                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 0, 1, %s, %s, %s)",
                 (id_bot, client_id, monto_total, cantidad_recibida, cantidad_productos,
-                 tipo_venta, ahora, ahora),
+                 tipo_venta, (direccion.strip() if direccion else None), ahora, ahora),
             )
             folio = int(cur.lastrowid)
 

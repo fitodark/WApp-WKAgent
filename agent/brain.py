@@ -12,6 +12,7 @@ from agent.tools import (
     obtener_horario_semanal_texto,
     obtener_menu_desde_db,
     registrar_pedido,
+    registrar_cliente,
     obtener_telefono_sucursal,
     obtener_catalogo_config,
 )
@@ -74,12 +75,29 @@ HERRAMIENTAS = [
                 },
                 "direccion": {
                     "type": "string",
-                    "description": "Dirección de entrega (solo si es a domicilio)",
+                    "description": "Dirección de entrega indicada por el cliente (obligatoria si es a domicilio)",
                 },
             },
             "required": ["tipo_entrega", "items", "cantidad_recibida"],
         },
-    }
+    },
+    {
+        "name": "registrar_cliente",
+        "description": (
+            "Da de alta a un cliente NUEVO con su nombre completo y dirección. Úsala SOLO cuando "
+            "en 'Cliente actual' diga que NO está registrado y el cliente vaya a hacer un pedido. "
+            "Si el número ya existiera, no duplica. No pidas estos datos si el cliente ya está registrado."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre": {"type": "string", "description": "Nombre completo del cliente"},
+                "direccion": {"type": "string", "description": "Dirección completa (para domicilio)"},
+                "referencia": {"type": "string", "description": "Referencias o indicaciones de ubicación (opcional)"},
+            },
+            "required": ["nombre"],
+        },
+    },
 ]
 
 
@@ -115,15 +133,17 @@ def _extraer_texto(response) -> str:
     return "\n".join(p for p in partes if p).strip()
 
 
-async def _ejecutar_herramienta(nombre: str, args: dict, client_id: int | None) -> dict:
-    """Ejecuta la herramienta pedida por Claude. client_id se inyecta del lado servidor."""
+async def _ejecutar_herramienta(nombre: str, args: dict, client_id: int | None, telefono: str | None) -> dict:
+    """Ejecuta la herramienta pedida por Claude. client_id y telefono se inyectan del lado servidor."""
     if nombre == "registrar_pedido":
-        return await registrar_pedido(client_id=client_id, **args)
+        return await registrar_pedido(client_id=client_id, telefono=telefono, **args)
+    if nombre == "registrar_cliente":
+        return await registrar_cliente(telefono=telefono, **args)
     logger.warning(f"Herramienta desconocida solicitada: {nombre}")
     return {"ok": False, "error": f"Herramienta no soportada: {nombre}"}
 
 
-async def generar_respuesta(mensaje: str, historial: list[dict], cliente: dict | None = None) -> str:
+async def generar_respuesta(mensaje: str, historial: list[dict], cliente: dict | None = None, telefono: str | None = None) -> str:
     """
     Genera una respuesta usando Claude API.
 
@@ -244,7 +264,7 @@ async def generar_respuesta(mensaje: str, historial: list[dict], cliente: dict |
             for bloque in response.content:
                 if getattr(bloque, "type", None) != "tool_use":
                     continue
-                resultado = await _ejecutar_herramienta(bloque.name, bloque.input, client_id)
+                resultado = await _ejecutar_herramienta(bloque.name, bloque.input, client_id, telefono)
                 resultados.append({
                     "type": "tool_result",
                     "tool_use_id": bloque.id,
