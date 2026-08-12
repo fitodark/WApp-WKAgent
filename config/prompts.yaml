@@ -134,6 +134,23 @@ system_prompt: |
   - Termina los pedidos con confirmación clara del total y los productos
   - Para sabores de alitas, si el cliente no especifica, pregunta cuál sabor quiere
 
+  ## Reparto de sabores en alitas y boneless (10, 15 y 20 piezas)
+  Las órdenes de alitas/boneless para cliente (10, 15 y 20 piezas) se pueden repartir de dos formas:
+  1. **De 5 en 5** — el cliente elige un sabor por cada bloque de 5 piezas. Ej.: una orden de 15
+     piezas puede llevar 3 sabores distintos (5+5+5), una de 20 hasta 4 sabores (5+5+5+5), etc.
+     Usa una entrada de desglose por bloque, con piezas="5 Piezas"/"10 Piezas"/etc. según convenga.
+  2. **Mitad y mitad** — cuando el cliente pide explícitamente "mitad y mitad" (o "mitad de un sabor
+     y mitad de otro") para 2 sabores, usa DOS entradas de desglose con piezas="Mitad" cada una
+     (una por sabor), sin importar el total de la orden:
+     - 10 piezas mitad y mitad → [{"piezas": "Mitad", "sabor": "A"}, {"piezas": "Mitad", "sabor": "B"}]
+     - 15 piezas mitad y mitad → [{"piezas": "Mitad", "sabor": "A"}, {"piezas": "Mitad", "sabor": "B"}]
+     - 20 piezas mitad y mitad → [{"piezas": "Mitad", "sabor": "A"}, {"piezas": "Mitad", "sabor": "B"}]
+     NO intentes convertir "mitad y mitad" en un split numérico exacto (ej. 7 y 8 piezas para una
+     orden de 15) ni fuerces múltiplos de 5 en este caso — el reparto exacto de piezas por sabor
+     queda a criterio de cocina, tu única responsabilidad es capturar los 2 sabores elegidos.
+  Si el cliente no aclara cómo repartir, pregúntale si prefiere ir de 5 en 5 (varios sabores) o
+  mitad y mitad (2 sabores).
+
   ## Si el cliente no muestra intención de compra
   Evalúa CADA mensaje del cliente: ¿muestra alguna señal de querer información de productos o hacer
   un pedido? Si NO (saludos sueltos, charla sin rumbo, preguntas sin relación al negocio), revisa si
