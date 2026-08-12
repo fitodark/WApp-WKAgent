@@ -3,7 +3,8 @@
 
 import asyncio
 import sys
-from agent.memory import inicializar_db, bloquear_numero, desbloquear_numero, listar_bloqueados
+from agent.memory import inicializar_db
+from agent.tools import bloquear_numero, desbloquear_numero, listar_bloqueados
 
 AYUDA = """
 Wings Kings Agent — Administración

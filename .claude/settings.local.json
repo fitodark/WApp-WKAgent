@@ -18,7 +18,29 @@
       "Write",
       "Edit",
       "Glob",
-      "Grep"
+      "Grep",
+      "Bash(xargs -I{} echo {})",
+      "Artifact",
+      "Skill(claude-api)",
+      "Bash(python -m py_compile agent/brain.py agent/brain_common.py agent/brain_claude.py agent/brain_openrouter.py)",
+      "Bash(pip show *)",
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile agent/tools.py)",
+      "Bash(gh api *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(python -m py_compile agent/providers/openwa.py)",
+      "Bash(python -m py_compile agent/main.py)",
+      "WebFetch(domain:openrouter.ai)",
+      "WebFetch(domain:open.er-api.com)",
+      "Bash(python -m py_compile agent/brain_common.py agent/brain_claude.py agent/brain_openrouter.py agent/brain.py)",
+      "Bash(php -l /d/Documents/GitHub/wingskingslvl/app/Traits/PrintSales.php)",
+      "Bash(python -m py_compile agent/main.py agent/brain_common.py agent/brain_claude.py agent/brain_openrouter.py agent/brain.py)",
+      "Bash(python -m py_compile agent/memory.py agent/brain_common.py agent/brain_claude.py agent/brain_openrouter.py agent/main.py)",
+      "Bash(python -m py_compile agent/brain_common.py)",
+      "Bash(php -l \"/d/Documents/GitHub/wingskingslvl/database/migrations/2026_08_09_000001_create_numeros_bloqueados_table.php\")",
+      "Bash(php -l \"/d/Documents/GitHub/wingskingslvl/database/migrations/2026_08_09_000002_create_contador_sin_intencion_table.php\")",
+      "Bash(python -m py_compile agent/memory.py agent/tools.py agent/brain_common.py agent/brain_claude.py agent/brain_openrouter.py agent/main.py agent/brain.py admin.py)"
     ]
   }
 }

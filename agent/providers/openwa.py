@@ -25,8 +25,27 @@ class ProveedorOpenWA(ProveedorWhatsApp):
 
         evento = body.get("event")
         data = body.get("data", {}) or {}
-        mensaje_id = data.get("id", "")
         chat_id = data.get("from", "")
+
+        # El nombre del campo con el ID de WhatsApp ha variado entre versiones de OpenWA
+        # (id / waMessageId / msgId); probamos en ese orden.
+        mensaje_id = data.get("id") or data.get("waMessageId") or data.get("msgId") or ""
+
+        # 'idempotencyKey' (a nivel raíz del payload) es la siguiente opción — pero OpenWA
+        # a veces manda el placeholder "msg_unknown" cuando tampoco pudo resolver un ID
+        # real (ej. en chats @lid); en ese caso NO sirve, todos los mensajes distintos
+        # llegarían con el mismo valor y se deduplicarían entre sí por error.
+        if not mensaje_id:
+            idempotency_key = body.get("idempotencyKey", "")
+            if idempotency_key and idempotency_key != "msg_unknown":
+                mensaje_id = idempotency_key
+
+        # Último recurso: id sintético estable a partir del contenido del mensaje y su
+        # propio timestamp (el de WhatsApp, NO 'deliveryId' — ese cambia en cada reintento
+        # de entrega del webhook aunque sea el mismo mensaje).
+        if not mensaje_id:
+            mensaje_id = f"synth_{chat_id}_{data.get('timestamp', '')}_{data.get('body', '')[:80]}"
+
         logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={chat_id} body={data.get('body')!r}")
 
         # OpenWA emite varios eventos; solo procesamos mensajes entrantes
@@ -37,8 +56,7 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         if data.get("isGroup"):
             return []
 
-        # En OpenWA el id arranca con "true_" cuando el mensaje lo envio el propio numero
-        es_propio = mensaje_id.startswith("true_")
+        es_propio = bool(data.get("fromMe", False))
 
         # Número real para buscar en clients. Si el chat viene como @lid (WhatsApp
         # multi-device oculta el teléfono), lo resolvemos; si ya es @c.us, el chat_id

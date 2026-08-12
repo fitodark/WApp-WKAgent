@@ -1,6 +1,14 @@
 # agent/memory.py — Memoria de conversaciones con SQLite
 # Generado por AgentKit
 
+"""
+Historial de conversación y deduplicación de webhooks — local al agente (SQLite).
+
+El bloqueo de números y el contador de mensajes sin intención de compra viven
+en la MariaDB compartida con el POS (ver agent/tools.py), no aquí, para que el
+panel de Laravel pueda administrarlos sin necesitar acceso a este servidor.
+"""
+
 import os
 from datetime import datetime
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -33,16 +41,6 @@ class Mensaje(Base):
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class NumeroBlockeado(Base):
-    """Números vetados por mal uso del servicio."""
-    __tablename__ = "numeros_bloqueados"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telefono: Mapped[str] = mapped_column(String(50), unique=True, index=True)
-    motivo: Mapped[str] = mapped_column(Text)
-    bloqueado_en: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class WebhookProcesado(Base):
@@ -110,39 +108,6 @@ async def limpiar_historial(telefono: str):
         await session.commit()
 
 
-async def es_numero_bloqueado(telefono: str) -> bool:
-    """Retorna True si el número está en la lista de bloqueados."""
-    async with async_session() as session:
-        query = select(NumeroBlockeado).where(NumeroBlockeado.telefono == telefono)
-        result = await session.execute(query)
-        return result.scalar_one_or_none() is not None
-
-
-async def bloquear_numero(telefono: str, motivo: str):
-    """Agrega un número a la lista de bloqueados."""
-    async with async_session() as session:
-        bloqueado = NumeroBlockeado(
-            telefono=telefono,
-            motivo=motivo,
-            bloqueado_en=datetime.utcnow()
-        )
-        session.add(bloqueado)
-        await session.commit()
-
-
-async def desbloquear_numero(telefono: str):
-    """Elimina un número de la lista de bloqueados."""
-    async with async_session() as session:
-        query = select(NumeroBlockeado).where(NumeroBlockeado.telefono == telefono)
-        result = await session.execute(query)
-        registro = result.scalar_one_or_none()
-        if registro:
-            await session.delete(registro)
-            await session.commit()
-            return True
-        return False
-
-
 async def marcar_procesado(mensaje_id: str) -> bool:
     """
     Intenta registrar un mensaje_id como procesado.
@@ -159,14 +124,3 @@ async def marcar_procesado(mensaje_id: str) -> bool:
         except IntegrityError:
             await session.rollback()
             return False
-
-
-async def listar_bloqueados() -> list[dict]:
-    """Retorna la lista completa de números bloqueados."""
-    async with async_session() as session:
-        result = await session.execute(select(NumeroBlockeado).order_by(NumeroBlockeado.bloqueado_en.desc()))
-        registros = result.scalars().all()
-        return [
-            {"telefono": r.telefono, "motivo": r.motivo, "bloqueado_en": str(r.bloqueado_en)}
-            for r in registros
-        ]

@@ -178,12 +178,12 @@ _DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domin
 # Horario por defecto (fallback si configs['business_hours'] no tiene ese día).
 # Minutos desde medianoche; 24:00 = 1440 = cierre en medianoche. None = cerrado.
 _HORARIO_DEFAULT = {
-    0: (16 * 60, 24 * 60),  # Lunes
-    1: (16 * 60, 24 * 60),  # Martes
-    2: (16 * 60, 24 * 60),  # Miércoles
-    3: (16 * 60, 24 * 60),  # Jueves
-    4: (16 * 60, 24 * 60),  # Viernes
-    5: (16 * 60, 24 * 60),  # Sábado
+    0: (13 * 60, 24 * 60),  # Lunes
+    1: (13 * 60, 24 * 60),  # Martes
+    2: (13 * 60, 24 * 60),  # Miércoles
+    3: (13 * 60, 24 * 60),  # Jueves
+    4: (13 * 60, 24 * 60),  # Viernes
+    5: (13 * 60, 24 * 60),  # Sábado
     6: (13 * 60, 24 * 60),  # Domingo
 }
 
@@ -758,3 +758,142 @@ async def registrar_pedido(
         return {"ok": False, "error": "No se pudo registrar el pedido por un problema técnico."}
     finally:
         conn.close()
+
+
+# ════════════════════════════════════════════════════════════
+# Bloqueo de números y contador de mensajes sin intención de compra
+#
+# Viven en la MariaDB compartida con el POS (no en la SQLite local del agente)
+# para que el panel de Laravel pueda mostrar/desbloquear números sin necesitar
+# acceso al servidor del agente. Tablas: numeros_bloqueados, contador_sin_intencion
+# (migraciones en el repo wingskingslvl). 'telefono' es el chat_id de WhatsApp
+# (ej. '5219535409577@lid'), el mismo que usa agent/memory.py para el historial.
+# ════════════════════════════════════════════════════════════
+
+async def es_numero_bloqueado(telefono: str) -> bool:
+    """Retorna True si el número (chat_id de WhatsApp) está bloqueado."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1 FROM numeros_bloqueados WHERE telefono = %s LIMIT 1", (telefono,))
+            row = await cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        logger.error(f"Error al consultar numeros_bloqueados: {e}")
+        return False
+
+
+async def bloquear_numero(telefono: str, motivo: str):
+    """Bloquea un número (chat_id) por incumplimiento de las políticas de uso."""
+    ahora = datetime.now()
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO numeros_bloqueados (telefono, motivo, bloqueado_en, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE motivo = VALUES(motivo), bloqueado_en = VALUES(bloqueado_en), "
+                "updated_at = VALUES(updated_at)",
+                (telefono, motivo, ahora, ahora, ahora),
+            )
+            await conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error al bloquear número {telefono}: {e}")
+
+
+async def desbloquear_numero(telefono: str) -> bool:
+    """
+    Quita el bloqueo de un número Y reinicia su contador de mensajes sin intención.
+
+    Si no se reiniciara el contador, un cliente recién desbloqueado que mande UN
+    mensaje sin intención de compra quedaría bloqueado otra vez de inmediato
+    (el contador seguiría en 3 desde antes).
+
+    Returns:
+        True si el número SÍ estaba bloqueado (y se quitó), False si no estaba.
+    """
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM numeros_bloqueados WHERE telefono = %s", (telefono,))
+            eliminado = cur.rowcount > 0
+            await cur.execute(
+                "UPDATE contador_sin_intencion SET contador = 0 WHERE telefono = %s", (telefono,)
+            )
+            await conn.commit()
+        conn.close()
+        return eliminado
+    except Exception as e:
+        logger.error(f"Error al desbloquear número {telefono}: {e}")
+        return False
+
+
+async def listar_bloqueados() -> list[dict]:
+    """Retorna la lista completa de números bloqueados, más recientes primero."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT telefono, motivo, bloqueado_en FROM numeros_bloqueados ORDER BY bloqueado_en DESC"
+            )
+            filas = await cur.fetchall()
+        conn.close()
+        return [
+            {"telefono": f["telefono"], "motivo": f["motivo"], "bloqueado_en": str(f["bloqueado_en"])}
+            for f in filas
+        ]
+    except Exception as e:
+        logger.error(f"Error al listar números bloqueados: {e}")
+        return []
+
+
+async def obtener_contador_sin_intencion(telefono: str) -> int:
+    """Mensajes SEGUIDOS de este número sin intención de compra, hasta ahora."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT contador FROM contador_sin_intencion WHERE telefono = %s", (telefono,))
+            row = await cur.fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        logger.error(f"Error al leer contador_sin_intencion: {e}")
+        return 0
+
+
+async def incrementar_contador_sin_intencion(telefono: str) -> int:
+    """Suma 1 al contador de este número y devuelve el nuevo valor."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO contador_sin_intencion (telefono, contador, actualizado_en) "
+                "VALUES (%s, 1, %s) "
+                "ON DUPLICATE KEY UPDATE contador = contador + 1, actualizado_en = VALUES(actualizado_en)",
+                (telefono, datetime.now()),
+            )
+            await conn.commit()
+            await cur.execute("SELECT contador FROM contador_sin_intencion WHERE telefono = %s", (telefono,))
+            row = await cur.fetchone()
+        conn.close()
+        return int(row[0]) if row else 1
+    except Exception as e:
+        logger.error(f"Error al incrementar contador_sin_intencion: {e}")
+        return 0
+
+
+async def reiniciar_contador_sin_intencion(telefono: str):
+    """Reinicia el contador a 0 (el cliente mostró intención de compra en su último mensaje)."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE contador_sin_intencion SET contador = 0, actualizado_en = %s WHERE telefono = %s",
+                (datetime.now(), telefono),
+            )
+            await conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error al reiniciar contador_sin_intencion: {e}")

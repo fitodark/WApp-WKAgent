@@ -8,7 +8,10 @@ negocio:
     (Victoria, Corona, Modelo), y coctelería preparada (azulitos, mojitos, micheladas, etc.).
     Los productos se venden para consumo en el local y también a domicilio,
     con cobertura exclusiva en Huajuapan de León, Oaxaca.
-  horario: "Lunes a Sábado de 4:00 PM a 12:00 AM, Domingos de 1:00 PM a 12:00 AM"
+  # NOTA: este campo NO se usa en el flujo del agente — el horario real y el estado
+  # abierto/cerrado se calculan en vivo desde la tabla `configs` (business_hours) vía
+  # agent/tools.py (obtener_horario). Se deja aquí solo como referencia informativa.
+  horario: "Lunes a Domingo de 1:00 PM a 12:00 AM"
   ciudad: "Huajuapan de León, Oaxaca"
 
 agente:

@@ -2,6 +2,7 @@
 # Generado por AgentKit
 
 import os
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -9,9 +10,9 @@ from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 
 from agent.brain import generar_respuesta
-from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, es_numero_bloqueado, marcar_procesado
+from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, marcar_procesado
 from agent.providers import obtener_proveedor
-from agent.tools import buscar_cliente_por_telefono
+from agent.tools import buscar_cliente_por_telefono, es_numero_bloqueado, obtener_horario
 
 load_dotenv()
 
@@ -22,6 +23,16 @@ logger = logging.getLogger("agentkit")
 
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
+
+# Debounce: si el cliente manda varios mensajes seguidos (ej. los va escribiendo en
+# burbujas separadas), se espera este tiempo de inactividad antes de contestar, para
+# juntarlos en un solo turno en vez de responder cada uno por separado. Cada mensaje
+# nuevo reinicia la espera. Solo funciona correctamente con un único proceso/worker
+# (el estado vive en memoria); no aplica si se corre con varios workers de uvicorn.
+DEBOUNCE_SEGUNDOS = float(os.getenv("MENSAJE_DEBOUNCE_SEGUNDOS", "4"))
+
+_buffer_mensajes: dict[str, list] = {}
+_debounce_tasks: dict[str, asyncio.Task] = {}
 
 
 @asynccontextmanager
@@ -56,10 +67,89 @@ async def webhook_verificacion(request: Request):
     return {"status": "ok"}
 
 
+async def _procesar_lote(telefono: str):
+    """
+    Espera DEBOUNCE_SEGUNDOS de inactividad y, si nadie la canceló (es decir, no llegó
+    otro mensaje de este número mientras tanto), procesa TODOS los mensajes que se
+    hayan acumulado en el buffer como un solo turno y contesta una sola vez.
+    """
+    try:
+        await asyncio.sleep(DEBOUNCE_SEGUNDOS)
+    except asyncio.CancelledError:
+        # Llegó un mensaje nuevo antes de tiempo: se reprograma un debounce nuevo
+        # (ver webhook_handler), este intento se descarta sin procesar nada.
+        return
+
+    lote = _buffer_mensajes.pop(telefono, [])
+    _debounce_tasks.pop(telefono, None)
+    if not lote:
+        return
+
+    try:
+        if await es_numero_bloqueado(telefono):
+            logger.warning(f"Número bloqueado ignorado: {telefono}")
+            return
+
+        # Fuera de horario, no se llama al modelo — cada llamada cuesta tokens reales
+        # (~13K de system prompt) aunque solo sea para decir "estamos cerrados". Se
+        # responde con un mensaje fijo, sin gastar nada de la API del proveedor de IA.
+        horario = await obtener_horario()
+        if not horario["esta_abierto"]:
+            respuesta = (
+                f"Hey! 👋 Por el momento estamos cerrados. Nuestro horario es: {horario['horario']}. "
+                "¡Escríbenos cuando estemos abiertos y con gusto te atendemos! 🍗"
+            )
+            for m in lote:
+                await guardar_mensaje(telefono, "user", m.texto)
+            await guardar_mensaje(telefono, "assistant", respuesta)
+            enviado = await proveedor.enviar_mensaje(telefono, respuesta)
+            if enviado:
+                logger.info(f"Respuesta de horario (sin llamar al modelo) a {telefono}: {respuesta}")
+            else:
+                logger.error(f"No se pudo enviar la respuesta de horario a {telefono}")
+            return
+
+        # Número real para buscar en clients (el más reciente que se haya resuelto en el lote)
+        numero_real = next((m.numero for m in reversed(lote) if m.numero), telefono)
+
+        cliente = await buscar_cliente_por_telefono(numero_real)
+        if cliente:
+            logger.info(f"Cliente registrado: {cliente['name']}")
+
+        # Obtener historial ANTES de guardar los mensajes de este lote
+        historial = await obtener_historial(telefono)
+
+        # Varios mensajes seguidos del cliente se combinan en un solo turno para el modelo
+        texto_combinado = "\n".join(m.texto for m in lote)
+
+        respuesta = await generar_respuesta(
+            texto_combinado, historial, cliente=cliente, telefono=numero_real, chat_id=telefono
+        )
+
+        # Guardar cada mensaje del usuario tal cual llegó (preserva el historial real)
+        for m in lote:
+            await guardar_mensaje(telefono, "user", m.texto)
+        await guardar_mensaje(telefono, "assistant", respuesta)
+
+        enviado = await proveedor.enviar_mensaje(telefono, respuesta)
+        if enviado:
+            logger.info(f"Respuesta a {telefono} ({len(lote)} mensaje(s) agrupados): {respuesta}")
+        else:
+            logger.error(f"No se pudo enviar la respuesta a {telefono}")
+
+    except Exception as e:
+        # Un fallo en un lote no debe gatillar reintentos del webhook
+        logger.error(f"Error procesando lote de {telefono}: {e}")
+
+
 @app.post("/webhook")
 async def webhook_handler(request: Request):
     """
     Recibe mensajes de WhatsApp via el proveedor configurado.
+
+    No contesta cada mensaje al instante: lo encola por número y reinicia un debounce
+    de DEBOUNCE_SEGUNDOS (ver _procesar_lote). Así, si el cliente manda varios mensajes
+    seguidos, se juntan en una sola respuesta en vez de contestar cada uno por separado.
 
     SIEMPRE responde 200: los errores se aíslan por mensaje y se registran en el log.
     Devolver 500 haría que el proveedor (p.ej. OpenWA) reintente y reprocese el mismo
@@ -83,37 +173,12 @@ async def webhook_handler(request: Request):
 
             logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")
 
-            # Verificar si el número está bloqueado — ignorar sin responder
-            if await es_numero_bloqueado(msg.telefono):
-                logger.warning(f"Número bloqueado ignorado: {msg.telefono}")
-                continue
-
-            # Verificar si el cliente está registrado en Wings Kings.
-            # Usamos el número real (msg.numero); si el proveedor no lo resolvió,
-            # caemos al chatId (válido cuando ya viene como número, no @lid).
-            cliente = await buscar_cliente_por_telefono(msg.numero or msg.telefono)
-            if cliente:
-                logger.info(f"Cliente registrado: {cliente['name']}")
-
-            # Obtener historial ANTES de guardar el mensaje actual
-            historial = await obtener_historial(msg.telefono)
-
-            # Generar respuesta con Claude (con datos del cliente y el número real
-            # para resolver client_id / dar de alta cliente nuevo)
-            respuesta = await generar_respuesta(
-                msg.texto, historial, cliente=cliente, telefono=(msg.numero or msg.telefono)
-            )
-
-            # Guardar mensaje del usuario Y respuesta del agente
-            await guardar_mensaje(msg.telefono, "user", msg.texto)
-            await guardar_mensaje(msg.telefono, "assistant", respuesta)
-
-            # Enviar respuesta por WhatsApp
-            enviado = await proveedor.enviar_mensaje(msg.telefono, respuesta)
-            if enviado:
-                logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
-            else:
-                logger.error(f"No se pudo enviar la respuesta a {msg.telefono}")
+            # Encolar y (re)iniciar el debounce de este número
+            _buffer_mensajes.setdefault(msg.telefono, []).append(msg)
+            tarea_previa = _debounce_tasks.get(msg.telefono)
+            if tarea_previa and not tarea_previa.done():
+                tarea_previa.cancel()
+            _debounce_tasks[msg.telefono] = asyncio.create_task(_procesar_lote(msg.telefono))
 
         except Exception as e:
             # Un fallo en un mensaje no debe abortar el resto del lote ni gatillar reintentos
