@@ -32,3 +32,8 @@ class ProveedorWhatsApp(ABC):
     async def validar_webhook(self, request: Request) -> dict | int | None:
         """Verificación GET del webhook (solo Meta la requiere). Retorna respuesta o None."""
         return None
+
+    async def enviar_estado_escribiendo(self, telefono: str) -> None:
+        """Muestra el indicador de 'escribiendo...' en el chat. Best-effort: no todos los
+        proveedores lo soportan, y nunca debe interrumpir el flujo si falla. No-op por defecto."""
+        return None

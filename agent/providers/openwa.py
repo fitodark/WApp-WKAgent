@@ -116,6 +116,25 @@ class ProveedorOpenWA(ProveedorWhatsApp):
                 return "".join(c for c in str(valor) if c.isdigit())
         return ""
 
+    async def enviar_estado_escribiendo(self, telefono: str) -> None:
+        """Activa el indicador nativo de 'escribiendo...' en el chat (best-effort — nunca
+        interrumpe el flujo si falla). Endpoint agregado en la version reciente de OpenWA."""
+        if not self.api_key:
+            return
+        url = f"{self.base_url}/api/sessions/{self.session_id}/chats/typing"
+        headers = {
+            "X-API-Key": self.api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {"chatId": telefono, "state": "typing"}
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(url, json=payload, headers=headers, timeout=5.0)
+                if r.status_code != 200:
+                    logger.warning(f"No se pudo activar 'escribiendo' para {telefono}: {r.status_code} — {r.text}")
+        except Exception as e:
+            logger.warning(f"Error al activar 'escribiendo' para {telefono}: {e}")
+
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
         """Envia un mensaje de texto via la API REST de OpenWA."""
         if not self.api_key:

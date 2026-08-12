@@ -90,6 +90,10 @@ async def _procesar_lote(telefono: str):
             logger.warning(f"Número bloqueado ignorado: {telefono}")
             return
 
+        # Le da al cliente la sensación de que su mensaje ya está siendo atendido mientras
+        # se genera la respuesta (que puede tardar varios segundos, sobre todo con tool-use)
+        await proveedor.enviar_estado_escribiendo(telefono)
+
         # Fuera de horario, no se llama al modelo — cada llamada cuesta tokens reales
         # (~13K de system prompt) aunque solo sea para decir "estamos cerrados". Se
         # responde con un mensaje fijo, sin gastar nada de la API del proveedor de IA.
