@@ -40,7 +40,20 @@
       "Bash(python -m py_compile agent/brain_common.py)",
       "Bash(php -l \"/d/Documents/GitHub/wingskingslvl/database/migrations/2026_08_09_000001_create_numeros_bloqueados_table.php\")",
       "Bash(php -l \"/d/Documents/GitHub/wingskingslvl/database/migrations/2026_08_09_000002_create_contador_sin_intencion_table.php\")",
-      "Bash(python -m py_compile agent/memory.py agent/tools.py agent/brain_common.py agent/brain_claude.py agent/brain_openrouter.py agent/main.py agent/brain.py admin.py)"
+      "Bash(python -m py_compile agent/memory.py agent/tools.py agent/brain_common.py agent/brain_claude.py agent/brain_openrouter.py agent/main.py agent/brain.py admin.py)",
+      "Bash(netstat -ano)",
+      "Bash(tasklist)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Get-CimInstance *)",
+      "Bash(wmic process *)",
+      "PowerShell(taskkill *)",
+      "Bash(timeout 15 python -m uvicorn agent.main:app --host 0.0.0.0 --port 8070)",
+      "Bash(python -m py_compile agent/brain_openrouter.py agent/brain.py agent/brain_claude.py agent/brain_common.py)",
+      "Bash(timeout 12 python -m uvicorn agent.main:app --host 0.0.0.0 --port 8070)",
+      "Bash(python -m uvicorn agent.main:app --host 0.0.0.0 --port 8070)",
+      "Bash(disown)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:8070/)"
     ]
   }
 }
