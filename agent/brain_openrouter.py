@@ -81,7 +81,21 @@ async def generar_respuesta(
     contador_sin_intencion = await obtener_contador_sin_intencion(chat_id) if chat_id else 0
     system_prompt, _telefono_sucursal = await construir_system_prompt(historial, cliente, contador_sin_intencion)
 
-    mensajes = [{"role": "system", "content": system_prompt}]
+    # Prompt caching: OpenRouter pasa el bloque 'cache_control' al proveedor subyacente
+    # cuando el modelo es de Anthropic (Claude vía OpenRouter). Mismo breakpoint que en
+    # brain_claude.py, mismo objetivo (~13K tokens fijos de menu/catalogos/reglas por
+    # llamada). PENDIENTE DE VALIDAR: a diferencia de brain_claude.py (SDK oficial,
+    # documentado), aquí no hay garantía de que OpenRouter realmente honre el cache_control
+    # para todos los modelos/proveedores que enruta — usar el log de cache_read/cache_write
+    # de abajo para confirmarlo en pruebas reales antes de asumir el ahorro.
+    mensajes = [{
+        "role": "system",
+        "content": [{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }],
+    }]
     for msg in historial:
         mensajes.append({
             "role": msg["role"],
@@ -113,9 +127,20 @@ async def generar_respuesta(
             choice = response.choices[0]
             mensaje_respuesta = choice.message
             usage = response.usage
+            # Campos de cache aun sin confirmar en OpenRouter (ver comentario donde se arma
+            # 'mensajes' mas arriba) — se registran todos los nombres plausibles para poder
+            # detectar en logs reales cual usa cada proveedor/modelo, si alguno.
+            detalle_prompt = getattr(usage, "prompt_tokens_details", None)
+            cache_leido = (
+                getattr(usage, "cache_read_input_tokens", None)
+                or getattr(detalle_prompt, "cached_tokens", None)
+                or "?"
+            )
+            cache_escrito = getattr(usage, "cache_creation_input_tokens", "?")
             logger.info(
                 f"OpenRouter/{MODEL} ({getattr(usage, 'prompt_tokens', '?')} in / "
-                f"{getattr(usage, 'completion_tokens', '?')} out, finish_reason={choice.finish_reason})"
+                f"{getattr(usage, 'completion_tokens', '?')} out, cache_read={cache_leido} "
+                f"cache_write={cache_escrito}, finish_reason={choice.finish_reason})"
             )
 
             if choice.finish_reason != "tool_calls" or not mensaje_respuesta.tool_calls:

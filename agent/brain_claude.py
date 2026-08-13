@@ -89,13 +89,24 @@ async def generar_respuesta(
             response = await client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                system=system_prompt,
+                # Prompt caching: el bloque de system (menu/catalogos/reglas, ~13K tokens fijos
+                # por llamada) se cachea con un breakpoint al final. Como tools se renderiza
+                # antes que system, este unico breakpoint cubre tools+system juntos. Un pedido
+                # normal hace ~10-12 llamadas con este mismo prefijo -> la primera "escribe" el
+                # cache (~1.25x costo) y las demas lo "leen" (~10% costo).
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 messages=mensajes,
                 tools=HERRAMIENTAS,
             )
+            cache_leido = getattr(response.usage, "cache_read_input_tokens", 0)
+            cache_escrito = getattr(response.usage, "cache_creation_input_tokens", 0)
             logger.info(
                 f"Claude/{MODEL} ({response.usage.input_tokens} in / {response.usage.output_tokens} out, "
-                f"stop={response.stop_reason})"
+                f"cache_read={cache_leido} cache_write={cache_escrito}, stop={response.stop_reason})"
             )
 
             if response.stop_reason != "tool_use":

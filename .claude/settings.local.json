@@ -55,7 +55,8 @@
       "Bash(disown)",
       "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:8070/)",
       "Bash(python -m py_compile agent/providers/base.py agent/providers/openwa.py agent/main.py)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "WebSearch"
     ]
   }
 }
