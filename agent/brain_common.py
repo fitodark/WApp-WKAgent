@@ -235,6 +235,15 @@ async def construir_system_prompt(
         f"\n- Estado: **{estado}**"
         f"\n- Horario hoy: {horario['horario']}"
         f"\nUsa esta información para determinar si debes atender el pedido o informar que estamos cerrados."
+        f"\nESTE Estado (\"{estado}\") es la ÚNICA fuente de verdad sobre si el negocio está abierto AHORA —"
+        " ignora cualquier ejemplo de texto sobre 'estamos cerrados' que hayas visto antes en este prompt,"
+        " ese texto es solo un ejemplo de FORMATO para cuando el Estado sea CERRADO, no un hecho."
+        + (
+            "\nEl Estado es ABIERTO: bajo NINGUNA circunstancia le digas al cliente que están cerrados"
+            " o que no puedes tomar su pedido por horario. Atiéndelo con normalidad."
+            if horario["esta_abierto"]
+            else ""
+        )
     )
 
     # Guía sobre mensajes sin intención de compra — el conteo lo lleva el código (memory.py),
@@ -249,7 +258,10 @@ async def construir_system_prompt(
         " herramienta marcar_sin_intencion (incluso si el contador de arriba está en 0 — así se"
         " registra el primero). Su resultado te dice el conteo actualizado y si ya se bloqueó la"
         " conversación (al llegar a 3):"
-        "\n- Si el conteo resultante es 1: responde normal, sin mencionar nada de strikes."
+        "\n- Si el conteo resultante es 1: NO menciones nada de strikes — en vez de eso, redirige"
+        " ACTIVAMENTE al cliente hacia una compra: pregúntale qué se le antoja, ofrécele el menú, o"
+        " pregúntale en qué le puedes ayudar. El objetivo es darle una oportunidad clara de mostrar"
+        " intención de compra antes de que un segundo mensaje sin intención cuente como strike visible."
         "\n- Si el conteo resultante es 2 y NO se bloqueó: avísale que se le aplicó un strike por"
         " infringir las políticas de uso del servicio (mensajes sin intención de compra) y que al"
         " 3er strike se le niega el servicio."
