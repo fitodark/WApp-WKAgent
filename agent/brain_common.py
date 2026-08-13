@@ -167,10 +167,18 @@ def obtener_mensaje_fallback() -> str:
 
 async def construir_system_prompt(
     historial: list[dict], cliente: dict | None, contador_sin_intencion: int = 0
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """
-    Arma el system prompt completo del turno: base (prompts.yaml) + menú vigente +
-    catálogos de sabores/piezas + horario + contexto del cliente actual.
+    Arma el system prompt del turno en dos bloques, para aprovechar prompt caching
+    (ver agent/brain_claude.py y agent/brain_openrouter.py):
+
+    - system_estable: base (prompts.yaml) + menú vigente + catálogos de sabores/piezas +
+      horario semanal. Prácticamente el mismo texto en cada llamada (cambia solo si el
+      menú/catálogos cambian en BD) — es el bloque que se marca con cache_control.
+    - system_volatil: hora actual (cambia cada minuto), contador de sin-intención y
+      contexto del cliente — cambia entre llamadas por diseño, por eso va SIN cache,
+      en un bloque aparte al final. Si esto se mezclara con el bloque estable, cualquier
+      cambio (ej. cruzar de minuto) invalidaría también la parte cacheable.
 
     Args:
         contador_sin_intencion: mensajes SEGUIDOS de este cliente, hasta antes de este turno,
@@ -179,8 +187,9 @@ async def construir_system_prompt(
             leyendo el historial (poco confiable).
 
     Returns:
-        (system_prompt, telefono_sucursal) — telefono_sucursal es el teléfono configurado
-        del negocio (tabla configs), usado para reemplazar el placeholder [TELÉFONO_SUCURSAL].
+        (system_estable, system_volatil, telefono_sucursal) — telefono_sucursal es el
+        teléfono configurado del negocio (tabla configs), usado para reemplazar el
+        placeholder [TELÉFONO_SUCURSAL].
     """
     system_prompt = cargar_system_prompt()
 
@@ -210,10 +219,16 @@ async def construir_system_prompt(
     horario_semanal = await obtener_horario_semanal_texto()
     system_prompt += f"\n\n## Horario de atención (vigente)\n{horario_semanal}"
 
+    # ════════════════════════════════════════════════════════════
+    # A partir de aquí es la parte VOLÁTIL (sin cache) — ver docstring.
+    # ════════════════════════════════════════════════════════════
+    system_estable = system_prompt
+    system_volatil = ""
+
     # Inyectar hora actual y estado abierto/cerrado para que el modelo no adivine
     horario = await obtener_horario()
     estado = "ABIERTO" if horario["esta_abierto"] else "CERRADO"
-    system_prompt += (
+    system_volatil += (
         f"\n\n## Estado actual del negocio"
         f"\n- Día: {horario['dia_actual']}"
         f"\n- Hora: {horario['hora_actual']}"
@@ -226,7 +241,7 @@ async def construir_system_prompt(
     # el modelo solo decide si ESTE mensaje muestra intención o no. SIEMPRE se inyecta (incluso
     # con contador=0): si esto solo apareciera cuando contador > 0, el contador nunca podría
     # pasar de 0 a 1 — el modelo jamás recibiría instrucción de llamar la tool la primera vez.
-    system_prompt += (
+    system_volatil += (
         f"\n\n## Mensajes sin intención de compra"
         f"\nEste cliente lleva {contador_sin_intencion} mensaje(s) SEGUIDO(s) sin ninguna intención"
         " de compra ni de pedir información de productos (charla sin rumbo, temas ajenos al negocio)."
@@ -248,7 +263,7 @@ async def construir_system_prompt(
     # Detectar si es el primer mensaje de la conversación (historial vacío)
     # para que el agente incluya la recomendación de políticas de uso en el saludo
     if not historial:
-        system_prompt += (
+        system_volatil += (
             "\n\n## PRIMER_MENSAJE_CONVERSACION"
             "\nEste es el PRIMER mensaje de esta conversación. Sigue estrictamente las reglas"
             " de la sección 'Saludo inicial' e incluye al final de tu respuesta la recomendación"
@@ -268,11 +283,11 @@ async def construir_system_prompt(
         if referencia:
             contexto_cliente += f"\n- Referencia: {referencia}"
         contexto_cliente += "\nTratalo por su nombre, salúdalo de vuelta si es la primera vez que escribe en la conversación."
-        system_prompt += contexto_cliente
+        system_volatil += contexto_cliente
     else:
-        system_prompt += "\n\n## Cliente actual\nEste cliente NO está registrado en Wings Kings. Atiéndelo con amabilidad, pero no asumas datos de dirección o preferencias previas."
+        system_volatil += "\n\n## Cliente actual\nEste cliente NO está registrado en Wings Kings. Atiéndelo con amabilidad, pero no asumas datos de dirección o preferencias previas."
 
-    return system_prompt, telefono_sucursal
+    return system_estable, system_volatil, telefono_sucursal
 
 
 async def ejecutar_herramienta(

@@ -79,22 +79,29 @@ async def generar_respuesta(
         return obtener_mensaje_fallback()
 
     contador_sin_intencion = await obtener_contador_sin_intencion(chat_id) if chat_id else 0
-    system_prompt, _telefono_sucursal = await construir_system_prompt(historial, cliente, contador_sin_intencion)
+    system_estable, system_volatil, _telefono_sucursal = await construir_system_prompt(
+        historial, cliente, contador_sin_intencion
+    )
 
     # Prompt caching: OpenRouter pasa el bloque 'cache_control' al proveedor subyacente
-    # cuando el modelo es de Anthropic (Claude vía OpenRouter). Mismo breakpoint que en
-    # brain_claude.py, mismo objetivo (~13K tokens fijos de menu/catalogos/reglas por
-    # llamada). PENDIENTE DE VALIDAR: a diferencia de brain_claude.py (SDK oficial,
-    # documentado), aquí no hay garantía de que OpenRouter realmente honre el cache_control
-    # para todos los modelos/proveedores que enruta — usar el log de cache_read/cache_write
-    # de abajo para confirmarlo en pruebas reales antes de asumir el ahorro.
+    # cuando el modelo es de Anthropic (Claude vía OpenRouter) — confirmado con pruebas
+    # reales el 2026-08-12 (cache_read_input_tokens != 0 en varias llamadas del mismo log).
+    # Dos bloques: el estable (menu/catalogos/reglas) lleva el breakpoint; el volatil (hora
+    # actual, contador, cliente) va sin cache al final — mezclarlos invalidaba el cache
+    # cada vez que cambiaba de minuto, aunque el resto del prompt fuera idéntico.
     mensajes = [{
         "role": "system",
-        "content": [{
-            "type": "text",
-            "text": system_prompt,
-            "cache_control": {"type": "ephemeral"},
-        }],
+        "content": [
+            {
+                "type": "text",
+                "text": system_estable,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": system_volatil,
+            },
+        ],
     }]
     for msg in historial:
         mensajes.append({

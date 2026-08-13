@@ -61,7 +61,9 @@ async def generar_respuesta(
         return obtener_mensaje_fallback()
 
     contador_sin_intencion = await obtener_contador_sin_intencion(chat_id) if chat_id else 0
-    system_prompt, _telefono_sucursal = await construir_system_prompt(historial, cliente, contador_sin_intencion)
+    system_estable, system_volatil, _telefono_sucursal = await construir_system_prompt(
+        historial, cliente, contador_sin_intencion
+    )
 
     mensajes = []
     for msg in historial:
@@ -89,16 +91,23 @@ async def generar_respuesta(
             response = await client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                # Prompt caching: el bloque de system (menu/catalogos/reglas, ~13K tokens fijos
-                # por llamada) se cachea con un breakpoint al final. Como tools se renderiza
-                # antes que system, este unico breakpoint cubre tools+system juntos. Un pedido
-                # normal hace ~10-12 llamadas con este mismo prefijo -> la primera "escribe" el
-                # cache (~1.25x costo) y las demas lo "leen" (~10% costo).
-                system=[{
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }],
+                # Prompt caching: dos bloques de system. El primero (menu/catalogos/reglas,
+                # ~13-15K tokens) es practicamente identico entre llamadas -> lleva el
+                # breakpoint. El segundo (hora actual, contador, cliente) cambia por diseño
+                # (la hora cambia cada minuto) y va SIN cache, al final, para no invalidar
+                # el bloque grande solo por ese detalle. Como tools se renderiza antes que
+                # system, el breakpoint del primer bloque cubre tools+ese bloque juntos.
+                system=[
+                    {
+                        "type": "text",
+                        "text": system_estable,
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "text",
+                        "text": system_volatil,
+                    },
+                ],
                 messages=mensajes,
                 tools=HERRAMIENTAS,
             )
