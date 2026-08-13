@@ -258,6 +258,10 @@ async def construir_system_prompt(
         f" adelante se comunique directamente a la sucursal al {telefono_sucursal}."
         "\nSi en cambio ESTE mensaje SÍ muestra intención de compra (pregunta por un producto,"
         " precio, menú, o quiere pedir), NO llames marcar_sin_intencion y atiéndelo con normalidad."
+        "\nEXCEPCIÓN — un saludo simple (ej. 'hola', 'buenas tardes', 'buenas noches', 'qué tal')"
+        " NUNCA cuenta como sin intención, aunque sea el único contenido del mensaje: es la forma"
+        " normal de abrir la plática en WhatsApp antes de pedir. Ante un saludo, NO llames"
+        " marcar_sin_intencion — respóndelo con normalidad y pregúntale en qué le ayudas."
     )
 
     # Detectar si es el primer mensaje de la conversación (historial vacío)
