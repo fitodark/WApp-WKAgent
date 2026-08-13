@@ -262,6 +262,10 @@ async def construir_system_prompt(
         " NUNCA cuenta como sin intención, aunque sea el único contenido del mensaje: es la forma"
         " normal de abrir la plática en WhatsApp antes de pedir. Ante un saludo, NO llames"
         " marcar_sin_intencion — respóndelo con normalidad y pregúntale en qué le ayudas."
+        "\nMisma EXCEPCIÓN para una despedida simple (ej. 'gracias', 'ok gracias', 'hasta luego',"
+        " 'nos vemos', 'bye', 'de nada'), sobre todo justo después de un pedido ya confirmado: es"
+        " el cierre normal de la conversación, no cuenta como sin intención. NO llames"
+        " marcar_sin_intencion — respóndela con algo breve y amable."
     )
 
     # Detectar si es el primer mensaje de la conversación (historial vacío)
