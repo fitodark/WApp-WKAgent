@@ -9,6 +9,7 @@ Se activa cuando PROVIDER_CHAT=openrouter (ver agent/brain.py).
 
 import os
 import json
+import asyncio
 import logging
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -21,7 +22,12 @@ from agent.brain_common import (
     folios_conocidos_en_historial,
     validar_folios_en_respuesta,
 )
-from agent.tools import obtener_contador_sin_intencion, reiniciar_contador_sin_intencion
+from agent.tools import (
+    obtener_contador_sin_intencion,
+    reiniciar_contador_sin_intencion,
+    obtener_contador_indecision,
+    reiniciar_contador_indecision,
+)
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
@@ -32,7 +38,10 @@ client = AsyncOpenAI(
 )
 
 MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-5")
-MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "1024"))
+# 1024 se quedaba corto en conversaciones largas: el modelo podía agotar el budget
+# en razonamiento interno antes de emitir texto visible, devolviendo content vacío
+# con finish_reason="length" (visto en producción el 2026-08-14, ver _llamar_modelo).
+MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "2048"))
 
 
 def _convertir_herramientas_openai(herramientas: list[dict]) -> list[dict]:
@@ -55,13 +64,59 @@ def _convertir_herramientas_openai(herramientas: list[dict]) -> list[dict]:
 TOOLS_OPENAI = _convertir_herramientas_openai(HERRAMIENTAS)
 
 
+async def _llamar_modelo(mensajes: list[dict], intentos: int = 2):
+    """
+    Llama a OpenRouter y reintenta una vez si la respuesta viene "vacía": sin texto
+    y sin tool_calls. Esto es un glitch transitorio del proveedor bajo carga (visto
+    en producción el 2026-08-14, varias veces seguidas en una sola conversación
+    durante un pico de concurrencia) — no un error de la API que lance excepción,
+    así que sin este retry se pierde el turno completo y el cliente recibe un
+    mensaje que le echa la culpa a él por "no escribir claro".
+    """
+    respuesta = None
+    for intento in range(intentos):
+        respuesta = await client.chat.completions.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=mensajes,
+            tools=TOOLS_OPENAI,
+        )
+        choice = respuesta.choices[0]
+        usage = respuesta.usage
+        detalle_prompt = getattr(usage, "prompt_tokens_details", None)
+        cache_leido = (
+            getattr(usage, "cache_read_input_tokens", None)
+            or getattr(detalle_prompt, "cached_tokens", None)
+            or "?"
+        )
+        cache_escrito = getattr(usage, "cache_creation_input_tokens", "?")
+        logger.info(
+            f"OpenRouter/{MODEL} ({getattr(usage, 'prompt_tokens', '?')} in / "
+            f"{getattr(usage, 'completion_tokens', '?')} out, cache_read={cache_leido} "
+            f"cache_write={cache_escrito}, finish_reason={choice.finish_reason})"
+        )
+
+        vacia = not choice.message.tool_calls and not (choice.message.content or "").strip()
+        if not vacia:
+            return respuesta
+
+        logger.warning(
+            f"Respuesta vacía de OpenRouter/{MODEL} (finish_reason={choice.finish_reason}) "
+            f"— intento {intento + 1}/{intentos}"
+        )
+        if intento < intentos - 1:
+            await asyncio.sleep(0.5)
+
+    return respuesta
+
+
 async def generar_respuesta(
     mensaje: str,
     historial: list[dict],
     cliente: dict | None = None,
     telefono: str | None = None,
     chat_id: str | None = None,
-) -> str:
+) -> tuple[str, str | None]:
     """
     Genera una respuesta usando un modelo servido por OpenRouter.
 
@@ -73,14 +128,16 @@ async def generar_respuesta(
         chat_id: Identificador de la conversación de WhatsApp (para bloquear_cliente)
 
     Returns:
-        La respuesta generada por el modelo
+        (texto, ruta_adjunto) — ruta_adjunto es la ruta local de una imagen a enviar
+        junto con el texto (ej. datos de transferencia), o None si no aplica.
     """
     if not mensaje or len(mensaje.strip()) < 2:
-        return obtener_mensaje_fallback()
+        return obtener_mensaje_fallback(), None
 
     contador_sin_intencion = await obtener_contador_sin_intencion(chat_id) if chat_id else 0
+    contador_indecision = await obtener_contador_indecision(chat_id) if chat_id else 0
     system_estable, system_volatil, _telefono_sucursal = await construir_system_prompt(
-        historial, cliente, contador_sin_intencion
+        historial, cliente, contador_sin_intencion, contador_indecision
     )
 
     # Prompt caching: OpenRouter pasa el bloque 'cache_control' al proveedor subyacente
@@ -121,41 +178,38 @@ async def generar_respuesta(
     folios_reales_turno: set[int] = set()
     # True si el modelo llamó marcar_sin_intencion en este turno (evita reiniciar el contador)
     marco_sin_intencion = False
+    # True si el modelo llamó marcar_indecision en este turno (evita reiniciar ese contador)
+    marco_indecision = False
+    # Adjuntos (ej. imagen de datos de transferencia) devueltos por alguna herramienta en
+    # este turno, para enviarlos junto con el texto final (ver agent/main.py)
+    adjuntos: list[str] = []
 
     try:
         # Loop de tool-use: el modelo puede invocar registrar_pedido antes de su respuesta final
         for _ in range(5):  # tope de seguridad de iteraciones
-            response = await client.chat.completions.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                messages=mensajes,
-                tools=TOOLS_OPENAI,
-            )
+            response = await _llamar_modelo(mensajes)
             choice = response.choices[0]
             mensaje_respuesta = choice.message
-            usage = response.usage
-            # Campos de cache aun sin confirmar en OpenRouter (ver comentario donde se arma
-            # 'mensajes' mas arriba) — se registran todos los nombres plausibles para poder
-            # detectar en logs reales cual usa cada proveedor/modelo, si alguno.
-            detalle_prompt = getattr(usage, "prompt_tokens_details", None)
-            cache_leido = (
-                getattr(usage, "cache_read_input_tokens", None)
-                or getattr(detalle_prompt, "cached_tokens", None)
-                or "?"
-            )
-            cache_escrito = getattr(usage, "cache_creation_input_tokens", "?")
-            logger.info(
-                f"OpenRouter/{MODEL} ({getattr(usage, 'prompt_tokens', '?')} in / "
-                f"{getattr(usage, 'completion_tokens', '?')} out, cache_read={cache_leido} "
-                f"cache_write={cache_escrito}, finish_reason={choice.finish_reason})"
-            )
 
             if choice.finish_reason != "tool_calls" or not mensaje_respuesta.tool_calls:
                 if not marco_sin_intencion and chat_id:
                     await reiniciar_contador_sin_intencion(chat_id)
-                texto = (mensaje_respuesta.content or "").strip() or obtener_mensaje_fallback()
+                if not marco_indecision and chat_id:
+                    await reiniciar_contador_indecision(chat_id)
+                contenido = (mensaje_respuesta.content or "").strip()
+                if not contenido:
+                    # Ya se reintentó una vez dentro de _llamar_modelo y siguió vacío —
+                    # esto es un glitch del proveedor, no que el cliente haya escrito
+                    # algo confuso, así que usamos el mensaje de error técnico y no el
+                    # de "no entendí tu mensaje" (ver incidente 2026-08-14).
+                    logger.error(
+                        f"OpenRouter/{MODEL} devolvió respuesta vacía tras reintento "
+                        f"(finish_reason={choice.finish_reason}) — chat_id={chat_id}"
+                    )
+                texto = contenido or obtener_mensaje_error()
                 folios_previos = folios_conocidos_en_historial(historial)
-                return validar_folios_en_respuesta(texto, folios_reales_turno, folios_previos)
+                texto = validar_folios_en_respuesta(texto, folios_reales_turno, folios_previos)
+                return texto, (adjuntos[-1] if adjuntos else None)
 
             # Ejecutar las herramientas solicitadas y devolver sus resultados al modelo
             mensajes.append({
@@ -181,6 +235,10 @@ async def generar_respuesta(
                     folios_reales_turno.add(int(resultado["folio"]))
                 if nombre == "marcar_sin_intencion":
                     marco_sin_intencion = True
+                if nombre == "marcar_indecision":
+                    marco_indecision = True
+                if nombre == "compartir_datos_transferencia" and resultado.get("ok") and resultado.get("adjunto"):
+                    adjuntos.append(resultado["adjunto"])
                 mensajes.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -188,8 +246,8 @@ async def generar_respuesta(
                 })
 
         logger.warning("Se alcanzó el tope de iteraciones de tool-use sin respuesta final (OpenRouter)")
-        return obtener_mensaje_error()
+        return obtener_mensaje_error(), None
 
     except Exception as e:
         logger.error(f"Error OpenRouter API: {e}")
-        return obtener_mensaje_error()
+        return obtener_mensaje_error(), None

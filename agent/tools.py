@@ -88,6 +88,36 @@ async def buscar_cliente_por_telefono(telefono: str) -> dict | None:
         return None
 
 
+async def guardar_ubicacion_cliente(telefono: str, lat: float, lng: float) -> bool:
+    """
+    Guarda la última ubicación (lat/lng) que el cliente compartió por WhatsApp, si ya
+    está registrado. WhatsApp SOLO entrega coordenadas de un pin — nunca un texto de
+    dirección, ni siquiera cuando el remitente comparte un lugar guardado con nombre
+    (confirmado con una prueba real el 2026-08-16) — así que esto es un dato
+    complementario para ubicar al repartidor, NUNCA sustituye la dirección escrita que
+    el cliente debe dar (ver 'Cómo tomar un pedido' en el prompt).
+
+    Returns:
+        True si se guardó (el cliente ya estaba registrado), False si no se encontró.
+    """
+    cliente = await buscar_cliente_por_telefono(telefono)
+    if not cliente:
+        return False
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE clients SET location_lat = %s, location_lng = %s, updated_at = %s WHERE id = %s",
+                (lat, lng, datetime.now(), cliente["id"]),
+            )
+            await conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error al guardar ubicación del cliente {telefono}: {e}")
+        return False
+
+
 async def cliente_registrado(telefono: str) -> bool:
     """Retorna True si el número de teléfono pertenece a un cliente registrado y activo."""
     cliente = await buscar_cliente_por_telefono(telefono)
@@ -292,6 +322,69 @@ async def obtener_horario() -> dict:
         "esta_abierto": esta_abierto,
         "hora_actual": ahora.strftime("%I:%M %p"),
         "dia_actual": _DIAS[dia],
+    }
+
+
+# Tiempo de entrega si ninguna ventana de configs['delivery_time_windows'] aplica a la
+# hora actual (o si la key no tiene filas todavía) — mismo rango que se usaba fijo antes
+# de este feature (QA pidió poder extenderlo en horas de alta demanda, 2026-08-16).
+_TIEMPO_ENTREGA_DEFAULT = (40, 60)
+
+
+def _formatear_minutos(m: int) -> str:
+    """40 -> '40 minutos' | 60 -> '1 hora' | 80 -> '1 hora 20 minutos'."""
+    horas, resto = divmod(m, 60)
+    if horas == 0:
+        return f"{resto} minutos"
+    texto = f"{horas} hora" + ("s" if horas > 1 else "")
+    if resto:
+        texto += f" {resto} minutos"
+    return texto
+
+
+async def _obtener_ventanas_tiempo_entrega() -> list[tuple[int, int, int, int]]:
+    """
+    Ventanas de tiempo de entrega desde configs['delivery_time_windows'], cada valor con
+    el formato '<etiqueta> [HH:MM HH:MM] MIN-MAX' (mismo estilo que business_hours).
+    Retorna lista de (apertura_min, cierre_min, entrega_min, entrega_max) en minutos.
+    Filas con formato inválido se ignoran (con warning) en vez de tronar todo el prompt.
+    """
+    ventanas = []
+    patron = re.compile(
+        r"\[\s*(\d{1,2}):(\d{2})\s*[-–—]?\s*(\d{1,2}):(\d{2})\s*\]\s*(\d+)\s*[-–—]\s*(\d+)"
+    )
+    for value in await obtener_catalogo_config("delivery_time_windows"):
+        m = patron.search(value or "")
+        if not m:
+            logger.warning(f"delivery_time_windows con formato inválido (ignorado): {value!r}")
+            continue
+        h1, m1, h2, m2, emin, emax = m.groups()
+        ventanas.append((int(h1) * 60 + int(m1), int(h2) * 60 + int(m2), int(emin), int(emax)))
+    return ventanas
+
+
+async def obtener_tiempo_entrega() -> dict:
+    """
+    Tiempo de entrega estimado AHORA (hora de México), según la ventana de
+    configs['delivery_time_windows'] en la que caiga la hora actual. Si ninguna
+    ventana configurada aplica, usa _TIEMPO_ENTREGA_DEFAULT.
+
+    Returns:
+        {"minutos_min": int, "minutos_max": int, "texto": "entre 40 minutos y 1 hora"}
+    """
+    ahora = _ahora_local()
+    minutos = ahora.hour * 60 + ahora.minute
+
+    emin, emax = _TIEMPO_ENTREGA_DEFAULT
+    for apertura, cierre, ventana_min, ventana_max in await _obtener_ventanas_tiempo_entrega():
+        if apertura <= minutos < cierre:
+            emin, emax = ventana_min, ventana_max
+            break
+
+    return {
+        "minutos_min": emin,
+        "minutos_max": emax,
+        "texto": f"entre {_formatear_minutos(emin)} y {_formatear_minutos(emax)}",
     }
 
 
@@ -550,10 +643,17 @@ async def registrar_cliente(
         return {"ok": False, "error": "No se pudo dar de alta al cliente por un problema técnico."}
 
 
+# El negocio NO tiene terminal para pagos con tarjeta — solo efectivo (se paga al
+# recibir el pedido) o transferencia (queda pendiente de validación manual, ver
+# payment_type=2 más abajo). "tarjeta" NUNCA es un método de pago válido aquí.
+_PAYMENT_TYPES = {"efectivo": 1, "transferencia": 2}
+
+
 async def registrar_pedido(
     items: list[dict],
     tipo_entrega: str,
     cantidad_recibida: float,
+    metodo_pago: str = "efectivo",
     client_id: int | None = None,
     direccion: str | None = None,
     telefono: str | None = None,
@@ -569,17 +669,30 @@ async def registrar_pedido(
             {"producto_id": int, "cantidad": int, "descripcion": str|None}
             'descripcion' es opcional (sabores/notas de esa línea).
         tipo_entrega: "domicilio" → ventas.type=2 | "recoger" → ventas.type=3
-        cantidad_recibida: monto con el que paga el cliente (para calcular el cambio)
+        cantidad_recibida: monto con el que paga el cliente (para calcular el cambio).
+            En transferencia no hay cambio, así que debe ser igual al total.
+        metodo_pago: "efectivo" (payment_type=1, se paga al recibir) o "transferencia"
+            (payment_type=2, queda pendiente de validación manual por el equipo).
         client_id: id del cliente en clients, o None (se intenta resolver por teléfono)
         direccion: dirección de entrega indicada en el chat; se guarda en ventas.direccion_envio
         telefono: número real del remitente (se inyecta del lado servidor) para resolver client_id
 
     Returns:
-        {"ok": True, "folio": int, "total": float, "cambio": float}
+        {"ok": True, "folio": int, "total": float, "cambio": float, "metodo_pago": str}
         o {"ok": False, "error": "..."}
     """
     if not items:
         return {"ok": False, "error": "El pedido no tiene productos."}
+
+    payment_type = _PAYMENT_TYPES.get(metodo_pago)
+    if payment_type is None:
+        return {
+            "ok": False,
+            "error": (
+                f"Método de pago no soportado: {metodo_pago!r}. Solo se acepta 'efectivo' "
+                "(se paga al recibir) o 'transferencia'. No existe pago con tarjeta/terminal."
+            ),
+        }
 
     # Red de seguridad: no registrar pedidos fuera del horario de atención
     horario = await obtener_horario()
@@ -691,7 +804,9 @@ async def registrar_pedido(
 
             # Idempotencia: evitar doble registro del MISMO pedido (p.ej. doble confirmación
             # cuando el cliente reescribe). Si ya hay un pedido del agente idéntico (mismo
-            # total, cantidad, tipo y cliente/dirección) en los últimos 10 min, se reutiliza.
+            # total, cantidad, tipo, método de pago y cliente/dirección) en los últimos 10
+            # min, se reutiliza. payment_type entra al match para no confundir, p.ej., un
+            # pedido en efectivo con uno por transferencia que casualmente dé el mismo total.
             desde = ahora - timedelta(minutes=10)
             if client_id is not None:
                 cond, extra = "client_id = %s", [client_id]
@@ -699,9 +814,9 @@ async def registrar_pedido(
                 cond, extra = "client_id IS NULL AND direccion_envio <=> %s", [direccion_norm]
             await cur.execute(
                 "SELECT ventaId FROM ventas WHERE venta_agente = 1 AND estatus = 1 "
-                "AND type = %s AND montoTotal = %s AND cantidadProductos = %s "
+                "AND type = %s AND montoTotal = %s AND cantidadProductos = %s AND payment_type = %s "
                 "AND created_at >= %s AND " + cond + " ORDER BY ventaId DESC LIMIT 1",
-                [tipo_venta, monto_total, cantidad_productos, desde] + extra,
+                [tipo_venta, monto_total, cantidad_productos, payment_type, desde] + extra,
             )
             dup = await cur.fetchone()
             if dup:
@@ -713,6 +828,7 @@ async def registrar_pedido(
                     "folio": folio_dup,
                     "total": monto_total,
                     "cambio": cambio_dup if cambio_dup > 0 else 0.0,
+                    "metodo_pago": metodo_pago,
                     "duplicado": True,
                 }
 
@@ -725,9 +841,9 @@ async def registrar_pedido(
                 " montoIva, cantidadRecibida, cantidadProductos, type, estatus, activo, "
                 " `order`, apply_discount, payment_type, venta_agente, direccion_envio, "
                 " created_at, updated_at) "
-                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, 1, 1, %s, %s, %s)",
+                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, %s, 1, %s, %s, %s)",
                 (id_bot, client_id, monto_total, cantidad_recibida, cantidad_productos,
-                 tipo_venta, direccion_norm, ahora, ahora),
+                 tipo_venta, payment_type, direccion_norm, ahora, ahora),
             )
             folio = int(cur.lastrowid)
 
@@ -744,12 +860,16 @@ async def registrar_pedido(
 
         await conn.commit()
         cambio = round(float(cantidad_recibida) - monto_total, 2)
-        logger.info(f"Pedido registrado — folio={folio} total={monto_total} type={tipo_venta}")
+        logger.info(
+            f"Pedido registrado — folio={folio} total={monto_total} type={tipo_venta} "
+            f"payment_type={payment_type}"
+        )
         return {
             "ok": True,
             "folio": folio,
             "total": monto_total,
             "cambio": cambio if cambio > 0 else 0.0,
+            "metodo_pago": metodo_pago,
         }
 
     except Exception as e:
@@ -805,11 +925,18 @@ async def bloquear_numero(telefono: str, motivo: str):
 
 async def desbloquear_numero(telefono: str) -> bool:
     """
-    Quita el bloqueo de un número Y reinicia su contador de mensajes sin intención.
+    Quita el bloqueo de un número, reinicia su contador de mensajes sin intención,
+    Y borra su historial de conversación (reinicio limpio).
 
     Si no se reiniciara el contador, un cliente recién desbloqueado que mande UN
     mensaje sin intención de compra quedaría bloqueado otra vez de inmediato
     (el contador seguiría en 3 desde antes).
+
+    Si no se borrara el historial, el modelo seguiría viendo en el historial
+    (obtener_historial no filtra por fecha) el mensaje donde el propio agente le
+    avisó al cliente que su conversación quedó bloqueada — y repetiría esa misma
+    narrativa en turnos futuros aunque el bloqueo técnico ya se haya quitado
+    (caso real: cliente 219610485944477@lid, 2026-08-17/18).
 
     Returns:
         True si el número SÍ estaba bloqueado (y se quitó), False si no estaba.
@@ -824,6 +951,10 @@ async def desbloquear_numero(telefono: str) -> bool:
             )
             await conn.commit()
         conn.close()
+        if eliminado:
+            from agent.memory import limpiar_historial
+            await limpiar_historial(telefono)
+            logger.info(f"Historial de conversación reiniciado tras desbloqueo ({telefono})")
         return eliminado
     except Exception as e:
         logger.error(f"Error al desbloquear número {telefono}: {e}")
@@ -897,3 +1028,64 @@ async def reiniciar_contador_sin_intencion(telefono: str):
         conn.close()
     except Exception as e:
         logger.error(f"Error al reiniciar contador_sin_intencion: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+# Contador de indecisión (mismo patrón que contador_sin_intencion, tabla separada)
+#
+# A diferencia de sin_intencion (charla SIN interés de compra → bloquea a los 3), este
+# cuenta mensajes SEGUIDOS en los que el cliente SÍ muestra intención de compra pero
+# esquiva la pregunta de cierre que se le acaba de hacer (cambia de tema, inventa
+# productos, se contradice) — la conversación no converge. Al llegar a 4 NO se bloquea:
+# solo se deja la charla en stand-by con un mensaje amable (ver marcar_indecision en
+# brain_common.py). Incidente que motivó esto: 2026-08-14, conversación de Fernando.
+# ════════════════════════════════════════════════════════════
+
+async def obtener_contador_indecision(telefono: str) -> int:
+    """Intercambios SEGUIDOS de este número esquivando la pregunta de cierre, hasta ahora."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT contador FROM contador_indecision WHERE telefono = %s", (telefono,))
+            row = await cur.fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        logger.error(f"Error al leer contador_indecision: {e}")
+        return 0
+
+
+async def incrementar_contador_indecision(telefono: str) -> int:
+    """Suma 1 al contador de este número y devuelve el nuevo valor."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO contador_indecision (telefono, contador, actualizado_en) "
+                "VALUES (%s, 1, %s) "
+                "ON DUPLICATE KEY UPDATE contador = contador + 1, actualizado_en = VALUES(actualizado_en)",
+                (telefono, datetime.now()),
+            )
+            await conn.commit()
+            await cur.execute("SELECT contador FROM contador_indecision WHERE telefono = %s", (telefono,))
+            row = await cur.fetchone()
+        conn.close()
+        return int(row[0]) if row else 1
+    except Exception as e:
+        logger.error(f"Error al incrementar contador_indecision: {e}")
+        return 0
+
+
+async def reiniciar_contador_indecision(telefono: str):
+    """Reinicia el contador a 0 (el cliente respondió la pregunta de cierre o avanzó hacia una decisión)."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE contador_indecision SET contador = 0, actualizado_en = %s WHERE telefono = %s",
+                (datetime.now(), telefono),
+            )
+            await conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error al reiniciar contador_indecision: {e}")

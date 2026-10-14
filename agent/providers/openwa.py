@@ -2,7 +2,9 @@
 # Generado por AgentKit
 
 import os
+import base64
 import logging
+import mimetypes
 from urllib.parse import quote
 import httpx
 from fastapi import Request
@@ -46,7 +48,11 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         if not mensaje_id:
             mensaje_id = f"synth_{chat_id}_{data.get('timestamp', '')}_{data.get('body', '')[:80]}"
 
-        logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={chat_id} body={data.get('body')!r}")
+        tipo = data.get("type")
+        _cuerpo_log = data.get("body")
+        if isinstance(_cuerpo_log, str) and len(_cuerpo_log) > 200:
+            _cuerpo_log = f"<{len(_cuerpo_log)} chars>"
+        logger.info(f"[OpenWA webhook] event={evento} id={mensaje_id} from={chat_id} type={tipo} body={_cuerpo_log!r}")
 
         # OpenWA emite varios eventos; solo procesamos mensajes entrantes
         if evento != "message.received":
@@ -67,12 +73,25 @@ class ProveedorOpenWA(ProveedorWhatsApp):
             numero = chat_id
         logger.debug(f"[OpenWA] chat={chat_id} numero_real={numero or '(no resuelto)'}")
 
+        # Mensaje de ubicación: 'body' en este caso NO es texto — es un blob enorme (confirmado
+        # en vivo el 2026-08-16, ~5000 chars, probablemente una miniatura de mapa en base64) que
+        # nunca debe tratarse como texto del chat. Las coordenadas reales vienen en 'location'.
+        # OJO: WhatsApp solo entrega lat/lng aquí — NUNCA un texto de dirección, ni siquiera
+        # cuando el remitente comparte un lugar guardado con nombre (confirmado con prueba real).
+        ubicacion = None
+        if tipo == "location":
+            loc = data.get("location") or {}
+            lat, lng = loc.get("latitude"), loc.get("longitude")
+            if lat is not None and lng is not None:
+                ubicacion = (float(lat), float(lng))
+
         return [MensajeEntrante(
             telefono=chat_id,
-            texto=data.get("body", ""),
+            texto="" if ubicacion else data.get("body", ""),
             mensaje_id=mensaje_id,
             es_propio=es_propio,
             numero=numero or "",
+            ubicacion=ubicacion,
         )]
 
     async def _resolver_numero(self, contact_id: str) -> str:
@@ -148,9 +167,53 @@ class ProveedorOpenWA(ProveedorWhatsApp):
         }
         payload = {"chatId": telefono, "text": mensaje}
 
+        # Sin timeout explícito, un hipo momentáneo de OpenWA (visto en producción el
+        # 2026-08-16: ReadTimeout a los 5s del default de httpx) tumba la excepción sin
+        # capturar hasta el manejador genérico del webhook, con un log casi vacío y sin
+        # forma de saber si el mensaje sí se envió del otro lado (a veces sí llega).
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(url, json=payload, headers=headers, timeout=15.0)
+        except Exception as e:
+            logger.error(f"Error de red al enviar mensaje a {telefono}: {e}")
+            return False
+
+        if r.status_code not in (200, 201):
+            logger.error(f"Error OpenWA: {r.status_code} — {r.text}")
+            return False
+        return True
+
+    async def enviar_imagen(self, telefono: str, ruta_archivo: str, caption: str | None = None) -> bool:
+        """Envía una imagen local via la API REST de OpenWA (endpoint send-image, en base64
+        porque el archivo vive en disco — no en una URL pública)."""
+        if not self.api_key:
+            logger.warning("OPENWA_API_KEY no configurado — imagen no enviada")
+            return False
+
+        try:
+            with open(ruta_archivo, "rb") as f:
+                datos = f.read()
+        except OSError as e:
+            logger.error(f"No se pudo leer el adjunto {ruta_archivo}: {e}")
+            return False
+
+        mimetype = mimetypes.guess_type(ruta_archivo)[0] or "image/jpeg"
+        url = f"{self.base_url}/api/sessions/{self.session_id}/messages/send-image"
+        headers = {
+            "X-API-Key": self.api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "chatId": telefono,
+            "base64": base64.b64encode(datos).decode("ascii"),
+            "mimetype": mimetype,
+        }
+        if caption:
+            payload["caption"] = caption
+
         async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload, headers=headers)
+            r = await client.post(url, json=payload, headers=headers, timeout=20.0)
             if r.status_code not in (200, 201):
-                logger.error(f"Error OpenWA: {r.status_code} — {r.text}")
+                logger.error(f"Error OpenWA enviando imagen: {r.status_code} — {r.text}")
                 return False
             return True

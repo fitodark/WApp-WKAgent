@@ -14,6 +14,7 @@ class MensajeEntrante:
     mensaje_id: str     # ID único del mensaje
     es_propio: bool     # True si lo envió el agente (se ignora)
     numero: str = ""    # Número real del remitente para buscar en clients (resuelto si el chat es @lid)
+    ubicacion: tuple[float, float] | None = None  # (lat, lng) si el mensaje es una ubicación compartida
 
 
 class ProveedorWhatsApp(ABC):
@@ -37,3 +38,8 @@ class ProveedorWhatsApp(ABC):
         """Muestra el indicador de 'escribiendo...' en el chat. Best-effort: no todos los
         proveedores lo soportan, y nunca debe interrumpir el flujo si falla. No-op por defecto."""
         return None
+
+    async def enviar_imagen(self, telefono: str, ruta_archivo: str, caption: str | None = None) -> bool:
+        """Envía una imagen local (ej. datos de transferencia). No-op por defecto — los
+        proveedores que la soporten deben sobreescribirla; retorna False si no se implementa."""
+        return False

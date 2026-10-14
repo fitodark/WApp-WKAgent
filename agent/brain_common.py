@@ -11,12 +11,14 @@ agent/brain_claude.py y agent/brain_openrouter.py importan de aquí para no
 duplicar reglas de negocio entre proveedores.
 """
 
+import os
 import re
 import yaml
 import logging
 from agent.tools import (
     obtener_horario,
     obtener_horario_semanal_texto,
+    obtener_tiempo_entrega,
     obtener_menu_desde_db,
     registrar_pedido,
     registrar_cliente,
@@ -24,6 +26,8 @@ from agent.tools import (
     obtener_catalogo_config,
     bloquear_numero,
     incrementar_contador_sin_intencion,
+    incrementar_contador_indecision,
+    reiniciar_contador_indecision,
 )
 
 logger = logging.getLogger("agentkit")
@@ -79,15 +83,40 @@ HERRAMIENTAS = [
                 },
                 "cantidad_recibida": {
                     "type": "number",
-                    "description": "Monto con el que paga el cliente en efectivo (para calcular el cambio). Si paga exacto, es igual al total.",
+                    "description": (
+                        "Si metodo_pago='efectivo': monto con el que paga el cliente (para "
+                        "calcular el cambio); si paga exacto, es igual al total. Si metodo_pago="
+                        "'transferencia' no hay cambio, así que debe ser igual al total."
+                    ),
+                },
+                "metodo_pago": {
+                    "type": "string",
+                    "enum": ["efectivo", "transferencia"],
+                    "description": (
+                        "Cómo va a pagar el cliente. Solo existen estas dos opciones — NO existe "
+                        "pago con tarjeta/terminal, el negocio no cuenta con una. 'efectivo' se "
+                        "paga al recibir el pedido. 'transferencia' queda pendiente de validación "
+                        "manual por el equipo (ver reglas de pago del prompt)."
+                    ),
                 },
                 "direccion": {
                     "type": "string",
                     "description": "Dirección de entrega indicada por el cliente (obligatoria si es a domicilio)",
                 },
             },
-            "required": ["tipo_entrega", "items", "cantidad_recibida"],
+            "required": ["tipo_entrega", "items", "cantidad_recibida", "metodo_pago"],
         },
+    },
+    {
+        "name": "compartir_datos_transferencia",
+        "description": (
+            "Envía la imagen con los datos bancarios para pagar por transferencia (CLABE, banco, "
+            "titular). Úsala SOLO cuando el cliente pida explícitamente que le compartas esos "
+            "datos — nunca la ofrezcas tú primero ni la uses solo porque el cliente ya dijo que "
+            "va a pagar por transferencia. La imagen se envía aparte de tu respuesta de texto; tu "
+            "respuesta debe simplemente indicar que ahí le compartes los datos."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "registrar_cliente",
@@ -115,6 +144,21 @@ HERRAMIENTAS = [
             "mensajes seguidos así). El resultado te dice el conteo actual y si ya se bloqueó la "
             "conversación automáticamente (al llegar a 3) — redacta tu respuesta según ese resultado. "
             "NO la llames si el cliente SÍ muestra intención de compra en su mensaje."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "marcar_indecision",
+        "description": (
+            "Marca que el cliente ESQUIVÓ la pregunta de cierre que le hiciste en tu mensaje "
+            "anterior (cambió de tema, inventó un producto que no existe, se contradijo) en "
+            "vez de contestarla. Úsala SOLO cuando el prompt te indique evaluar esto: tu ÚLTIMO "
+            "mensaje debe haber terminado en una pregunta de cierre concreta (sabor, "
+            "domicilio/recoger, forma de pago, confirmar el pedido). El resultado te dice el "
+            "conteo actual y si ya toca dejar la conversación en stand-by (al llegar a 4) — "
+            "redacta tu respuesta según ese resultado. NO la llames si el cliente SÍ respondió "
+            "la pregunta (aunque cambie de opinión) o si su pregunta de seguimiento acerca a una "
+            "decisión de compra — eso es exploración normal, no indecisión."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
@@ -166,7 +210,10 @@ def obtener_mensaje_fallback() -> str:
 
 
 async def construir_system_prompt(
-    historial: list[dict], cliente: dict | None, contador_sin_intencion: int = 0
+    historial: list[dict],
+    cliente: dict | None,
+    contador_sin_intencion: int = 0,
+    contador_indecision: int = 0,
 ) -> tuple[str, str, str]:
     """
     Arma el system prompt del turno en dos bloques, para aprovechar prompt caching
@@ -175,16 +222,19 @@ async def construir_system_prompt(
     - system_estable: base (prompts.yaml) + menú vigente + catálogos de sabores/piezas +
       horario semanal. Prácticamente el mismo texto en cada llamada (cambia solo si el
       menú/catálogos cambian en BD) — es el bloque que se marca con cache_control.
-    - system_volatil: hora actual (cambia cada minuto), contador de sin-intención y
-      contexto del cliente — cambia entre llamadas por diseño, por eso va SIN cache,
-      en un bloque aparte al final. Si esto se mezclara con el bloque estable, cualquier
-      cambio (ej. cruzar de minuto) invalidaría también la parte cacheable.
+    - system_volatil: hora actual (cambia cada minuto), contadores de sin-intención/
+      indecisión y contexto del cliente — cambia entre llamadas por diseño, por eso va
+      SIN cache, en un bloque aparte al final. Si esto se mezclara con el bloque estable,
+      cualquier cambio (ej. cruzar de minuto) invalidaría también la parte cacheable.
 
     Args:
         contador_sin_intencion: mensajes SEGUIDOS de este cliente, hasta antes de este turno,
             sin intención de compra (llevado en código — ver memory.py). Se inyecta al prompt
             para que el modelo sepa en qué número va, en vez de tener que contarlo él mismo
             leyendo el historial (poco confiable).
+        contador_indecision: intercambios SEGUIDOS, hasta antes de este turno, en los que el
+            cliente SÍ muestra intención de compra pero esquiva la pregunta de cierre que se
+            le hizo (distinto de sin_intencion — ver marcar_indecision).
 
     Returns:
         (system_estable, system_volatil, telefono_sucursal) — telefono_sucursal es el
@@ -246,6 +296,18 @@ async def construir_system_prompt(
         )
     )
 
+    # Tiempo de entrega vigente (varía por hora — QA pidió extenderlo en horas de alta
+    # demanda, 2026-08-16). Igual que con el horario: SIEMPRE se inyecta el valor real
+    # para que el modelo no use "40 min a 1 hora" de memoria fuera de esas horas.
+    tiempo_entrega = await obtener_tiempo_entrega()
+    system_volatil += (
+        f"\n\n## Tiempo de entrega estimado (vigente)"
+        f"\nEn este momento el tiempo estimado de entrega es **{tiempo_entrega['texto']}**."
+        " Usa EXACTAMENTE este rango cuando el cliente pregunte cuánto tarda su pedido o"
+        " cuando confirmes/registres un pedido — nunca uses '40 min a 1 hora' de memoria,"
+        " ese es solo un ejemplo de formato de otras partes de este prompt, no el valor real."
+    )
+
     # Guía sobre mensajes sin intención de compra — el conteo lo lleva el código (memory.py),
     # el modelo solo decide si ESTE mensaje muestra intención o no. SIEMPRE se inyecta (incluso
     # con contador=0): si esto solo apareciera cuando contador > 0, el contador nunca podría
@@ -278,6 +340,33 @@ async def construir_system_prompt(
         " 'nos vemos', 'bye', 'de nada'), sobre todo justo después de un pedido ya confirmado: es"
         " el cierre normal de la conversación, no cuenta como sin intención. NO llames"
         " marcar_sin_intencion — respóndela con algo breve y amable."
+    )
+
+    # Guía sobre indecisión — DISTINTO de "sin intención" de arriba: aquí el cliente SÍ
+    # quiere comprar, solo que la charla no converge (esquiva la pregunta de cierre en vez
+    # de contestarla). No bloquea, solo deja la charla en pausa. Igual que arriba, SIEMPRE
+    # se inyecta (incluso con contador=0) para que el modelo pueda registrar el primer esquive.
+    system_volatil += (
+        f"\n\n## Indecisión / conversación que no converge"
+        f"\nEste cliente lleva {contador_indecision} intercambio(s) SEGUIDO(s) esquivando la"
+        " pregunta de cierre que le hiciste, en vez de contestarla."
+        "\nEvalúa SOLO cuando tu ÚLTIMO mensaje en la conversación terminó en una pregunta de"
+        " cierre concreta (qué sabor, domicilio o recoger, cómo paga, confirmar el pedido, etc.):"
+        "\n- Si el mensaje del cliente SÍ responde esa pregunta (aunque cambie de opinión), o hace"
+        " una pregunta de seguimiento que genuinamente acerca a una decisión de compra, NO llames"
+        " marcar_indecision — es exploración normal, sigue el flujo con naturalidad."
+        "\n- Si el mensaje del cliente ESQUIVA la pregunta — tema nuevo sin relación, un producto"
+        " que ya le aclaraste que no existe, se contradice con algo que dijo antes (ej. 'ya no soy"
+        " alérgico', cambia el número de personas o el presupuesto sin razón), o trivia sin intención"
+        " real de cerrar — DEBES llamar marcar_indecision. Su resultado te dice el conteo"
+        " actualizado y si ya toca dejar la conversación en stand-by (al llegar a 4)."
+        "\n- Si tu último mensaje NO terminó en una pregunta de cierre (ej. es el inicio de la"
+        " plática, ya diste un folio y el cliente no pidió nada nuevo, o le compartiste el menú sin"
+        " pedirle nada todavía), NO llames marcar_indecision."
+        "\n- Si el resultado indica en_stand_by=true: despídete con calidez, algo como \"Veo que"
+        " seguimos platicando pero no hemos cerrado nada 😅 lo dejamos en pausa por ahora,"
+        " escríbeme cuando ya tengas claro qué se te antoja y con gusto seguimos 🍗\" — NO sigas"
+        " ofreciendo más opciones ni contestando la tangente de ese mismo mensaje."
     )
 
     # Detectar si es el primer mensaje de la conversación (historial vacío)
@@ -321,6 +410,12 @@ async def ejecutar_herramienta(
     """
     if nombre == "registrar_pedido":
         return await registrar_pedido(client_id=client_id, telefono=telefono, **args)
+    if nombre == "compartir_datos_transferencia":
+        ruta = os.path.join("knowledge", "transfer_data.jpeg")
+        if not os.path.isfile(ruta):
+            logger.error(f"compartir_datos_transferencia: no se encontró {ruta}")
+            return {"ok": False, "error": "No se encontró la imagen de datos de transferencia."}
+        return {"ok": True, "adjunto": ruta}
     if nombre == "registrar_cliente":
         return await registrar_cliente(telefono=telefono, **args)
     if nombre == "bloquear_cliente":
@@ -341,6 +436,19 @@ async def ejecutar_herramienta(
             return {"ok": True, "conteo": conteo, "bloqueado": True}
         logger.info(f"Strike sin intención de compra ({chat_id}): {conteo}/3")
         return {"ok": True, "conteo": conteo, "bloqueado": False}
+    if nombre == "marcar_indecision":
+        if not chat_id:
+            return {"ok": False, "error": "No se pudo determinar la conversación."}
+        conteo = await incrementar_contador_indecision(chat_id)
+        if conteo >= 4:
+            # No se bloquea (el cliente no violó ninguna política) — solo se deja en
+            # stand-by y se reinicia el contador para no repetir el mensaje de pausa
+            # en cada tangente nueva que mande después.
+            await reiniciar_contador_indecision(chat_id)
+            logger.info(f"Conversación dejada en stand-by por indecisión ({chat_id})")
+            return {"ok": True, "conteo": conteo, "en_stand_by": True}
+        logger.info(f"Esquive de cierre por indecisión ({chat_id}): {conteo}/4")
+        return {"ok": True, "conteo": conteo, "en_stand_by": False}
     logger.warning(f"Herramienta desconocida solicitada: {nombre}")
     return {"ok": False, "error": f"Herramienta no soportada: {nombre}"}
 
