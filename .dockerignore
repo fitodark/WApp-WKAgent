@@ -1,0 +1,32 @@
+# Archivos que NO deben entrar a la imagen de Docker
+
+# Secretos — se pasan en tiempo de ejecución con env_file en docker-compose.yml
+.env
+
+# Base de datos y logs locales — en producción viven en volúmenes
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+*.log
+
+# Knowledge (archivos privados del negocio) — se monta como volumen
+knowledge/*
+!knowledge/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Git, IDE y OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db

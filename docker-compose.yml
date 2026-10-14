@@ -6,7 +6,19 @@ services:
       - "${PORT:-8000}:8000"
     env_file:
       - .env
+    environment:
+      # La BD SQLite vive en un volumen para que el historial sobreviva a
+      # reconstruir o recrear el contenedor. Si usas PostgreSQL/MySQL en
+      # DATABASE_URL dentro de .env, borra esta línea.
+      - DATABASE_URL=sqlite+aiosqlite:///./data/agentkit.db
     volumes:
       - ./knowledge:/app/knowledge
       - ./config:/app/config
+      - ./logs:/app/logs
+      - agentkit_data:/app/data
     restart: unless-stopped
+
+volumes:
+  # Volumen administrado por Docker (no carpeta de Windows): SQLite maneja
+  # mejor los bloqueos de archivo así en Docker Desktop
+  agentkit_data:
