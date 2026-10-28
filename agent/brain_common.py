@@ -19,6 +19,9 @@ from agent.tools import (
     obtener_horario,
     obtener_horario_semanal_texto,
     obtener_tiempo_entrega,
+    obtener_tiempo_express,
+    consultar_tarifa_envio,
+    detectar_colonia_en_direccion,
     obtener_menu_desde_db,
     registrar_pedido,
     registrar_cliente,
@@ -86,7 +89,24 @@ HERRAMIENTAS = [
                     "description": (
                         "Si metodo_pago='efectivo': monto con el que paga el cliente (para "
                         "calcular el cambio); si paga exacto, es igual al total. Si metodo_pago="
-                        "'transferencia' no hay cambio, así que debe ser igual al total."
+                        "'transferencia' no hay cambio, así que debe ser igual al total. Se calcula "
+                        "SOLO sobre el total del pedido: el costo del envío express NO se incluye "
+                        "(se paga aparte, directo al repartidor)."
+                    ),
+                },
+                "tipo_envio": {
+                    "type": "string",
+                    "enum": ["gratuito", "express"],
+                    "description": (
+                        "OBLIGATORIO si tipo_entrega='domicilio'. La opción que eligió el cliente "
+                        "entre las que devolvió consultar_envio para su colonia."
+                    ),
+                },
+                "colonia": {
+                    "type": "string",
+                    "description": (
+                        "OBLIGATORIO si tipo_entrega='domicilio'. Nombre de la colonia tal como lo "
+                        "devolvió consultar_envio."
                     ),
                 },
                 "metodo_pago": {
@@ -131,8 +151,26 @@ HERRAMIENTAS = [
                 "nombre": {"type": "string", "description": "Nombre completo del cliente"},
                 "direccion": {"type": "string", "description": "Dirección completa (para domicilio)"},
                 "referencia": {"type": "string", "description": "Referencias o indicaciones de ubicación (opcional)"},
+                "colonia": {"type": "string", "description": "Colonia o agencia del domicilio (para domicilio)"},
             },
             "required": ["nombre"],
+        },
+    },
+    {
+        "name": "consultar_envio",
+        "description": (
+            "Consulta las opciones de envío a domicilio para UNA colonia o agencia: si tiene "
+            "envío gratuito, si hay envío express y su costo adicional, y el tiempo de cada uno. "
+            "Úsala cuando ya conozcas la colonia del cliente y ANTES de mostrar el resumen del "
+            "pedido. Si no encuentra la colonia, devuelve sugerencias de nombres parecidos. "
+            "NUNCA la uses para armar o compartir una lista de colonias o de tarifas."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "colonia": {"type": "string", "description": "Colonia o agencia tal como la dijo el cliente"},
+            },
+            "required": ["colonia"],
         },
     },
     {
@@ -300,12 +338,14 @@ async def construir_system_prompt(
     # demanda, 2026-08-16). Igual que con el horario: SIEMPRE se inyecta el valor real
     # para que el modelo no use "40 min a 1 hora" de memoria fuera de esas horas.
     tiempo_entrega = await obtener_tiempo_entrega()
+    tiempo_express = await obtener_tiempo_express()
     system_volatil += (
         f"\n\n## Tiempo de entrega estimado (vigente)"
-        f"\nEn este momento el tiempo estimado de entrega es **{tiempo_entrega['texto']}**."
-        " Usa EXACTAMENTE este rango cuando el cliente pregunte cuánto tarda su pedido o"
-        " cuando confirmes/registres un pedido — nunca uses '40 min a 1 hora' de memoria,"
-        " ese es solo un ejemplo de formato de otras partes de este prompt, no el valor real."
+        f"\n- Envío gratuito: en este momento llega en **{tiempo_entrega['texto']}**."
+        f"\n- Envío express: llega en **{tiempo_express['texto']}**."
+        "\nUsa EXACTAMENTE el tiempo del tipo de envío del cliente cuando pregunte cuánto tarda"
+        " su pedido o cuando confirmes/registres un pedido — nunca uses '40 min a 1 hora' de"
+        " memoria, ese es solo un ejemplo de formato de otras partes de este prompt, no el valor real."
     )
 
     # Guía sobre mensajes sin intención de compra — el conteo lo lleva el código (memory.py),
@@ -389,6 +429,13 @@ async def construir_system_prompt(
             contexto_cliente += f"\n- Nombre: {nombre}"
         if direccion:
             contexto_cliente += f"\n- Dirección registrada: {direccion}"
+        colonia = cliente.get("colonia")
+        if colonia:
+            contexto_cliente += f"\n- Colonia registrada: {colonia}"
+        elif direccion:
+            colonia_detectada = await detectar_colonia_en_direccion(direccion)
+            if colonia_detectada:
+                contexto_cliente += f"\n- Colonia: {colonia_detectada} (detectada de la dirección, confírmala con el cliente)"
         if referencia:
             contexto_cliente += f"\n- Referencia: {referencia}"
         contexto_cliente += "\nTratalo por su nombre, salúdalo de vuelta si es la primera vez que escribe en la conversación."
@@ -418,6 +465,8 @@ async def ejecutar_herramienta(
         return {"ok": True, "adjunto": ruta}
     if nombre == "registrar_cliente":
         return await registrar_cliente(telefono=telefono, **args)
+    if nombre == "consultar_envio":
+        return await consultar_tarifa_envio(args.get("colonia", ""))
     if nombre == "bloquear_cliente":
         if not chat_id:
             return {"ok": False, "error": "No se pudo determinar la conversación a bloquear."}

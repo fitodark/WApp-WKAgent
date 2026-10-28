@@ -5,8 +5,10 @@ import os
 import re
 import json
 import yaml
+import difflib
 import secrets
 import logging
+import unicodedata
 import aiomysql
 from datetime import datetime, timezone, timedelta
 
@@ -74,7 +76,7 @@ async def buscar_cliente_por_telefono(telefono: str) -> dict | None:
         conn = await aiomysql.connect(**_db_config())
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
-                "SELECT id, name, address, reference, phone, active "
+                "SELECT id, name, address, colonia, reference, phone, active "
                 "FROM clients "
                 "WHERE phone LIKE %s AND active = 1 "
                 "LIMIT 1",
@@ -388,6 +390,188 @@ async def obtener_tiempo_entrega() -> dict:
     }
 
 
+# ════════════════════════════════════════════════════════════
+# Envío a domicilio: gratuito (del negocio) o express (servicio externo con tarifa
+# por colonia). Catálogo en la tabla tarifas_envio (migración de wingskingslvl).
+#
+# Reglas:
+# - envio_gratuito=1: se ofrece gratuito; express solo si la colonia tiene monto_express.
+# - envio_gratuito=0: por distancia solo hay express (siempre trae monto_express).
+# - El monto express es informativo: se paga directo al repartidor, no entra al total
+#   del pedido ni al ticket. Se guarda en ventas.monto_envio_express.
+# - El tarifario NUNCA se expone: todo se consulta de UNA colonia a la vez y las
+#   sugerencias (colonia no encontrada) llevan solo nombres, sin montos.
+# ════════════════════════════════════════════════════════════
+
+_TIEMPO_EXPRESS_DEFAULT = 30  # minutos, si configs['express_delivery_time'] falta o es inválido
+
+# Prefijos que la gente antepone al nombre ("Col. Centro", "Fracc. La Estancia").
+# Se quitan solo al inicio del texto; van de más largo a más corto.
+_PREFIJOS_COLONIA = (
+    "unidad habitacional", "agencia municipal", "fraccionamiento", "colonia",
+    "agencia", "barrio", "fracc", "frac", "col", "bo", "ag", "uh",
+)
+# Palabras que no ayudan a distinguir colonias ("La Joya" = "Joya").
+_PALABRAS_VACIAS = {"la", "el", "los", "las", "de", "del", "y"}
+# Ordinales y "sección" escritos de muchas formas ("1a.", "1ra", "primera", "secc").
+_SINONIMOS_COLONIA = {
+    "1a": "1", "1ra": "1", "1era": "1", "1er": "1", "primera": "1",
+    "2a": "2", "2da": "2", "segunda": "2",
+    "3a": "3", "3ra": "3", "3era": "3", "tercera": "3",
+    "secc": "seccion", "sec": "seccion",
+}
+
+
+def _normalizar_colonia(texto: str) -> str:
+    """'Col. Aviación 1a. Secc' -> 'aviacion 1 seccion'. Sin acentos, ñ->n, sin signos."""
+    t = unicodedata.normalize("NFKD", (texto or "").lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    t = " ".join(t.split())
+    quito = True
+    while quito:
+        quito = False
+        for prefijo in _PREFIJOS_COLONIA:
+            if t == prefijo or t.startswith(prefijo + " "):
+                t = t[len(prefijo):].strip()
+                quito = True
+                break
+    tokens = [_SINONIMOS_COLONIA.get(p, p) for p in t.split()]
+    return " ".join(p for p in tokens if p not in _PALABRAS_VACIAS)
+
+
+async def _cargar_tarifas() -> list[dict]:
+    """Catálogo activo de tarifas_envio (es chico: se compara en Python)."""
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT colonia, tipo, envio_gratuito, monto_express "
+                "FROM tarifas_envio WHERE activo = 1"
+            )
+            filas = await cur.fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error al leer tarifas_envio: {e}")
+        return []
+    return [
+        {
+            "colonia": f["colonia"],
+            "tipo": f["tipo"],
+            "envio_gratuito": bool(f["envio_gratuito"]),
+            # 0 o NULL = sin tarifa express cargada (no se ofrece un express "gratis")
+            "monto_express": float(f["monto_express"]) if f["monto_express"] else None,
+            "_norm": _normalizar_colonia(f["colonia"]),
+        }
+        for f in filas
+    ]
+
+
+def _buscar_en_tarifas(colonia: str, tarifas: list[dict]) -> tuple[dict | None, list[str]]:
+    """
+    Resuelve el texto del cliente contra el catálogo.
+
+    Returns:
+        (fila, []) si hay una sola coincidencia clara, o (None, sugerencias) con hasta 3
+        nombres del catálogo (sin montos) cuando no hay o hay varias.
+    """
+    buscado = _normalizar_colonia(colonia)
+    if not buscado:
+        return None, []
+
+    # 1) Nombre exacto
+    for t in tarifas:
+        if t["_norm"] == buscado:
+            return t, []
+
+    # 2) Palabras contenidas: "Centro" -> "Heroica Ciudad de Huajuapan de León Centro"
+    palabras = set(buscado.split())
+    contienen = [t for t in tarifas if palabras <= set(t["_norm"].split())]
+    if len(contienen) == 1:
+        return contienen[0], []
+    if contienen:
+        contienen.sort(key=lambda t: len(t["_norm"]))
+        return None, [t["colonia"] for t in contienen[:3]]
+
+    # 3) Parecido (errores de dedo)
+    por_norm = {t["_norm"]: t for t in tarifas}
+    parecidos = difflib.get_close_matches(buscado, list(por_norm), n=3, cutoff=0.75)
+    muy_parecidos = [
+        n for n in parecidos if difflib.SequenceMatcher(None, buscado, n).ratio() >= 0.9
+    ]
+    if len(muy_parecidos) == 1:
+        return por_norm[muy_parecidos[0]], []
+    return None, [por_norm[n]["colonia"] for n in parecidos]
+
+
+async def obtener_tiempo_express() -> dict:
+    """Tiempo estimado del envío express, de configs['express_delivery_time'] (minutos)."""
+    minutos = _TIEMPO_EXPRESS_DEFAULT
+    valores = await obtener_catalogo_config("express_delivery_time")
+    if valores:
+        try:
+            minutos = int(str(valores[0]).strip())
+        except ValueError:
+            logger.warning(f"express_delivery_time inválido (se usa {minutos}): {valores[0]!r}")
+    return {"minutos": minutos, "texto": _formatear_minutos(minutos)}
+
+
+async def consultar_tarifa_envio(colonia: str) -> dict:
+    """
+    Opciones de envío para UNA colonia o agencia. Nunca devuelve el catálogo completo.
+
+    Returns:
+        Encontrada: {"encontrada": True, "colonia", "tipo", "envio_gratuito",
+                     "express_disponible", "monto_express", "tiempo_gratuito", "tiempo_express"}
+        No encontrada: {"encontrada": False, "sugerencias": [nombres, sin montos]}
+    """
+    tarifas = await _cargar_tarifas()
+    if not tarifas:
+        return {"encontrada": False, "sugerencias": [], "error": "No se pudo consultar el catálogo de colonias."}
+
+    fila, sugerencias = _buscar_en_tarifas(colonia, tarifas)
+    if not fila:
+        return {"encontrada": False, "sugerencias": sugerencias}
+
+    express_disponible = fila["monto_express"] is not None
+    resultado = {
+        "encontrada": True,
+        "colonia": fila["colonia"],
+        "tipo": fila["tipo"],
+        "envio_gratuito": fila["envio_gratuito"],
+        "express_disponible": express_disponible,
+    }
+    if fila["envio_gratuito"]:
+        resultado["tiempo_gratuito"] = (await obtener_tiempo_entrega())["texto"]
+    if express_disponible:
+        resultado["monto_express"] = fila["monto_express"]
+        resultado["tiempo_express"] = (await obtener_tiempo_express())["texto"]
+    return resultado
+
+
+async def detectar_colonia_en_direccion(direccion: str) -> str | None:
+    """
+    Para clientes antiguos sin clients.colonia: busca un nombre del catálogo dentro de su
+    dirección escrita. Si la dirección trae "col."/"colonia"/"fracc."/etc., solo se busca
+    en lo que sigue a esa palabra, porque muchas calles se llaman igual que colonias
+    ("Calle Morelos, Col. Centro"). Devuelve solo el nombre; el agente debe confirmarlo.
+    """
+    if not direccion:
+        return None
+    texto = unicodedata.normalize("NFKD", direccion.lower())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    marca = re.search(r"\b(col|colonia|fracc?|fraccionamiento|barrio|agencia)\b", texto)
+    if marca:
+        texto = texto[marca.start():]
+    palabras = f" {_normalizar_colonia(texto)} "
+    mejor = None
+    for t in await _cargar_tarifas():
+        if t["_norm"] and f" {t['_norm']} " in palabras:
+            if mejor is None or len(t["_norm"]) > len(mejor["_norm"]):
+                mejor = t
+    return mejor["colonia"] if mejor else None
+
+
 async def obtener_horario_semanal_texto() -> str:
     """
     Horario semanal vigente en texto (default + overrides de configs), para inyectar
@@ -595,9 +779,13 @@ async def registrar_cliente(
     direccion: str | None = None,
     referencia: str | None = None,
     telefono: str | None = None,
+    colonia: str | None = None,
 ) -> dict:
     """
     Da de alta un cliente NUEVO en la tabla clients, solo si su teléfono no existe.
+
+    'colonia' se guarda con el nombre del catálogo tarifas_envio si se reconoce; si no,
+    tal como la escribió el cliente.
 
     Si el número ya está registrado NO duplica: devuelve el client_id existente.
     El 'telefono' se inyecta del lado servidor (número real del remitente).
@@ -623,14 +811,20 @@ async def registrar_cliente(
     if not phone or phone in await _numeros_propios():
         return {"ok": False, "error": "No se pudo determinar un número válido del cliente para darlo de alta."}
 
+    colonia_final = colonia.strip() if colonia and colonia.strip() else None
+    if colonia_final:
+        fila, _ = _buscar_en_tarifas(colonia_final, await _cargar_tarifas())
+        if fila:
+            colonia_final = fila["colonia"]
+
     ahora = datetime.now()
     try:
         conn = await aiomysql.connect(**_db_config())
         async with conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO clients (name, address, reference, phone, active, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, 1, %s, %s)",
-                (nombre.strip(), (direccion.strip() if direccion else None),
+                "INSERT INTO clients (name, address, colonia, reference, phone, active, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, 1, %s, %s)",
+                (nombre.strip(), (direccion.strip() if direccion else None), colonia_final,
                  (referencia.strip() if referencia else None), phone, ahora, ahora),
             )
             await conn.commit()
@@ -648,6 +842,9 @@ async def registrar_cliente(
 # payment_type=2 más abajo). "tarjeta" NUNCA es un método de pago válido aquí.
 _PAYMENT_TYPES = {"efectivo": 1, "transferencia": 2}
 
+# ventas.tipo_envio (solo pedidos a domicilio; NULL para recoger y ventas del POS)
+_TIPOS_ENVIO = {"gratuito": 1, "express": 2}
+
 
 async def registrar_pedido(
     items: list[dict],
@@ -657,6 +854,8 @@ async def registrar_pedido(
     client_id: int | None = None,
     direccion: str | None = None,
     telefono: str | None = None,
+    tipo_envio: str | None = None,
+    colonia: str | None = None,
 ) -> dict:
     """
     Inserta un pedido CONFIRMADO en ventas + ventasproductos y devuelve el folio.
@@ -676,9 +875,16 @@ async def registrar_pedido(
         client_id: id del cliente en clients, o None (se intenta resolver por teléfono)
         direccion: dirección de entrega indicada en el chat; se guarda en ventas.direccion_envio
         telefono: número real del remitente (se inyecta del lado servidor) para resolver client_id
+        tipo_envio: "gratuito" | "express" (obligatorio a domicilio). Se revalida contra
+            tarifas_envio: el monto express sale de la tabla, nunca del modelo.
+        colonia: colonia o agencia de entrega (obligatoria a domicilio)
+
+    El monto express es informativo (se paga directo al repartidor): se guarda en
+    ventas.monto_envio_express pero NO entra a montoTotal ni al cálculo del cambio.
 
     Returns:
-        {"ok": True, "folio": int, "total": float, "cambio": float, "metodo_pago": str}
+        {"ok": True, "folio": int, "total": float, "cambio": float, "metodo_pago": str,
+         "tipo_envio": str|None, "monto_envio_express": float|None, "tiempo_entrega": str|None}
         o {"ok": False, "error": "..."}
     """
     if not items:
@@ -711,6 +917,41 @@ async def registrar_pedido(
     # A domicilio la dirección es obligatoria (se guarda en el pedido para el ticket)
     if tipo_venta == 2 and not (direccion and direccion.strip()):
         return {"ok": False, "error": "Falta la dirección de entrega para el pedido a domicilio."}
+
+    # Envío (solo domicilio): gratuito o express, revalidado contra tarifas_envio
+    tipo_envio_cod = None      # ventas.tipo_envio: 1 gratuito, 2 express
+    monto_envio_express = None
+    colonia_envio = None
+    tiempo_entrega_texto = None
+    if tipo_venta == 2:
+        if tipo_envio not in _TIPOS_ENVIO:
+            return {"ok": False, "error": "Falta indicar el tipo de envío: 'gratuito' o 'express'."}
+        if not (colonia and colonia.strip()):
+            return {"ok": False, "error": "Falta la colonia de entrega; consúltala con consultar_envio antes de registrar."}
+        envio = await consultar_tarifa_envio(colonia)
+        if not envio["encontrada"]:
+            return {
+                "ok": False,
+                "error": f"La colonia '{colonia}' no está en el catálogo de envío.",
+                "sugerencias": envio.get("sugerencias", []),
+            }
+        colonia_envio = envio["colonia"]
+        if tipo_envio == "gratuito" and not envio["envio_gratuito"]:
+            return {
+                "ok": False,
+                "error": (
+                    f"{colonia_envio} solo tiene envío express (costo adicional de "
+                    f"${envio['monto_express']:.0f}, se paga directo al repartidor)."
+                ),
+            }
+        if tipo_envio == "express" and not envio["express_disponible"]:
+            return {"ok": False, "error": f"Para {colonia_envio} solo está disponible el envío gratuito."}
+        tipo_envio_cod = _TIPOS_ENVIO[tipo_envio]
+        if tipo_envio == "express":
+            monto_envio_express = envio["monto_express"]
+            tiempo_entrega_texto = envio["tiempo_express"]
+        else:
+            tiempo_entrega_texto = envio["tiempo_gratuito"]
 
     # Resolver el cliente por teléfono si no llegó client_id (p.ej. recién dado de alta)
     if client_id is None and telefono:
@@ -815,8 +1056,9 @@ async def registrar_pedido(
             await cur.execute(
                 "SELECT ventaId FROM ventas WHERE venta_agente = 1 AND estatus = 1 "
                 "AND type = %s AND montoTotal = %s AND cantidadProductos = %s AND payment_type = %s "
+                "AND tipo_envio <=> %s "
                 "AND created_at >= %s AND " + cond + " ORDER BY ventaId DESC LIMIT 1",
-                [tipo_venta, monto_total, cantidad_productos, payment_type, desde] + extra,
+                [tipo_venta, monto_total, cantidad_productos, payment_type, tipo_envio_cod, desde] + extra,
             )
             dup = await cur.fetchone()
             if dup:
@@ -829,6 +1071,9 @@ async def registrar_pedido(
                     "total": monto_total,
                     "cambio": cambio_dup if cambio_dup > 0 else 0.0,
                     "metodo_pago": metodo_pago,
+                    "tipo_envio": tipo_envio if tipo_venta == 2 else None,
+                    "monto_envio_express": monto_envio_express,
+                    "tiempo_entrega": tiempo_entrega_texto,
                     "duplicado": True,
                 }
 
@@ -840,10 +1085,12 @@ async def registrar_pedido(
                 "(IdUsuario, client_id, montoTotal, montoTotalDescuento, montoSubtotal, "
                 " montoIva, cantidadRecibida, cantidadProductos, type, estatus, activo, "
                 " `order`, apply_discount, payment_type, venta_agente, direccion_envio, "
+                " tipo_envio, monto_envio_express, colonia_envio, "
                 " created_at, updated_at) "
-                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, %s, 1, %s, %s, %s)",
+                "VALUES (%s, %s, %s, NULL, 0, 0, %s, %s, %s, 1, 1, 1, 0, %s, 1, %s, %s, %s, %s, %s, %s)",
                 (id_bot, client_id, monto_total, cantidad_recibida, cantidad_productos,
-                 tipo_venta, payment_type, direccion_norm, ahora, ahora),
+                 tipo_venta, payment_type, direccion_norm,
+                 tipo_envio_cod, monto_envio_express, colonia_envio, ahora, ahora),
             )
             folio = int(cur.lastrowid)
 
@@ -862,7 +1109,8 @@ async def registrar_pedido(
         cambio = round(float(cantidad_recibida) - monto_total, 2)
         logger.info(
             f"Pedido registrado — folio={folio} total={monto_total} type={tipo_venta} "
-            f"payment_type={payment_type}"
+            f"payment_type={payment_type} tipo_envio={tipo_envio_cod} colonia={colonia_envio!r} "
+            f"monto_express={monto_envio_express}"
         )
         return {
             "ok": True,
@@ -870,6 +1118,9 @@ async def registrar_pedido(
             "total": monto_total,
             "cambio": cambio if cambio > 0 else 0.0,
             "metodo_pago": metodo_pago,
+            "tipo_envio": tipo_envio if tipo_venta == 2 else None,
+            "monto_envio_express": monto_envio_express,
+            "tiempo_entrega": tiempo_entrega_texto,
         }
 
     except Exception as e:
