@@ -13,6 +13,7 @@ duplicar reglas de negocio entre proveedores.
 
 import os
 import re
+import asyncio
 import yaml
 import logging
 from agent.tools import (
@@ -32,6 +33,7 @@ from agent.tools import (
     incrementar_contador_indecision,
     reiniciar_contador_indecision,
     obtener_ultimo_pedido_agente,
+    imprimir_orden_cocina,
 )
 
 logger = logging.getLogger("agentkit")
@@ -469,6 +471,20 @@ async def construir_system_prompt(
     return system_estable, system_volatil, telefono_sucursal
 
 
+# Tareas de impresión en curso (se guarda la referencia para que no las recoja el GC)
+_impresiones_pendientes: set[asyncio.Task] = set()
+
+
+def _programar_impresion(folio: int):
+    """
+    Lanza la impresión de la orden en segundo plano: la respuesta al cliente no espera
+    a la impresora, y si la impresión falla solo queda en el log (ver imprimir_orden_cocina).
+    """
+    tarea = asyncio.create_task(imprimir_orden_cocina(folio))
+    _impresiones_pendientes.add(tarea)
+    tarea.add_done_callback(_impresiones_pendientes.discard)
+
+
 async def ejecutar_herramienta(
     nombre: str, args: dict, client_id: int | None, telefono: str | None, chat_id: str | None = None
 ) -> dict:
@@ -479,7 +495,11 @@ async def ejecutar_herramienta(
     del cliente resuelto para buscar en la BD de clientes).
     """
     if nombre == "registrar_pedido":
-        return await registrar_pedido(client_id=client_id, telefono=telefono, **args)
+        resultado = await registrar_pedido(client_id=client_id, telefono=telefono, **args)
+        # Folio nuevo → mandar la orden a cocina/barra. Un duplicado ya se imprimió antes.
+        if resultado.get("ok") and resultado.get("folio") and not resultado.get("duplicado"):
+            _programar_impresion(int(resultado["folio"]))
+        return resultado
     if nombre == "compartir_datos_transferencia":
         ruta = os.path.join("knowledge", "transfer_data.jpeg")
         if not os.path.isfile(ruta):

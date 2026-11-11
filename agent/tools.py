@@ -10,6 +10,7 @@ import secrets
 import logging
 import unicodedata
 import aiomysql
+import httpx
 from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("agentkit")
@@ -1185,6 +1186,41 @@ async def registrar_pedido(
 # (migraciones en el repo wingskingslvl). 'telefono' es el chat_id de WhatsApp
 # (ej. '5219535409577@lid'), el mismo que usa agent/memory.py para el historial.
 # ════════════════════════════════════════════════════════════
+
+async def imprimir_orden_cocina(folio: int) -> dict:
+    """
+    Pide a Laravel que imprima la orden de cocina/barra del folio que el agente acaba
+    de registrar (POST /api/agente/ventas/{folio}/imprimir-orden, header X-Agente-Token).
+
+    Nunca lanza excepción: si falla, solo se registra en el log. El pedido ya quedó en
+    la bandeja del POS, así que el mesero puede imprimirlo a mano.
+
+    Returns:
+        {"ok": bool, "status": int | None, "respuesta": dict | str}
+    """
+    base = os.getenv("LARAVEL_API_URL", "").rstrip("/")
+    token = os.getenv("AGENTE_TOKEN", "")
+    if not base or not token:
+        logger.warning(f"Impresión del folio #{folio} omitida: falta LARAVEL_API_URL o AGENTE_TOKEN en .env")
+        return {"ok": False, "status": None, "respuesta": "sin configuración"}
+    url = f"{base}/api/agente/ventas/{folio}/imprimir-orden"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(url, headers={"X-Agente-Token": token, "Accept": "application/json"})
+        try:
+            cuerpo = r.json()
+        except ValueError:
+            cuerpo = r.text[:300]
+        ok = r.status_code == 200 and isinstance(cuerpo, dict) and cuerpo.get("success") is True
+        if ok:
+            logger.info(f"Orden del folio #{folio} enviada a imprimir: {cuerpo}")
+        else:
+            logger.error(f"No se imprimió la orden del folio #{folio} (HTTP {r.status_code}): {cuerpo}")
+        return {"ok": ok, "status": r.status_code, "respuesta": cuerpo}
+    except Exception as e:
+        logger.error(f"Error al pedir la impresión del folio #{folio}: {e!r}")
+        return {"ok": False, "status": None, "respuesta": repr(e)}
+
 
 async def es_numero_bloqueado(telefono: str) -> bool:
     """Retorna True si el número (chat_id de WhatsApp) está bloqueado."""
