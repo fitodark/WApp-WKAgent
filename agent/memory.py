@@ -10,7 +10,7 @@ panel de Laravel pueda administrarlos sin necesitar acceso a este servidor.
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Text, DateTime, select, Integer
@@ -20,6 +20,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./agentkit.db")
+
+# Ventana de conversación: si el cliente deja de escribir más de estas horas, lo que
+# siga se trata como una conversación nueva (el historial anterior ya no se le pasa al
+# modelo). Evita que retome pedidos de semanas atrás o invente su estado.
+HISTORIAL_VENTANA_HORAS = float(os.getenv("HISTORIAL_VENTANA_HORAS", "6"))
 
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
@@ -72,29 +77,45 @@ async def guardar_mensaje(telefono: str, role: str, content: str):
 
 async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
     """
-    Recupera los últimos N mensajes de una conversación.
+    Recupera los mensajes de la conversación ACTUAL (máximo `limite`).
+
+    La conversación actual es el tramo de mensajes sin huecos mayores a
+    HISTORIAL_VENTANA_HORAS, contando hacia atrás desde ahora: si el último mensaje
+    guardado es de hace más de esa ventana, el historial viene vacío (conversación
+    nueva); si en medio hay un hueco mayor, se corta ahí.
 
     Args:
         telefono: Número de teléfono del cliente
         limite: Máximo de mensajes a recuperar (default: 20)
 
     Returns:
-        Lista de diccionarios con role y content
+        Lista de diccionarios con role y content, en orden cronológico
     """
+    ventana = timedelta(hours=HISTORIAL_VENTANA_HORAS)
     async with async_session() as session:
         query = (
             select(Mensaje)
             .where(Mensaje.telefono == telefono)
-            .order_by(Mensaje.timestamp.desc())
+            .order_by(Mensaje.timestamp.desc(), Mensaje.id.desc())
             .limit(limite)
         )
         result = await session.execute(query)
         mensajes = result.scalars().all()
-        mensajes.reverse()
-        return [
-            {"role": msg.role, "content": msg.content}
-            for msg in mensajes
-        ]
+
+    # Recorrer del más reciente al más viejo y cortar en el primer hueco > ventana
+    vigentes = []
+    referencia = datetime.utcnow()  # timestamps se guardan en UTC
+    for msg in mensajes:
+        if referencia - msg.timestamp > ventana:
+            break
+        vigentes.append(msg)
+        referencia = msg.timestamp
+
+    vigentes.reverse()
+    return [
+        {"role": msg.role, "content": msg.content}
+        for msg in vigentes
+    ]
 
 
 async def limpiar_historial(telefono: str):

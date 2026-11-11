@@ -31,6 +31,7 @@ from agent.tools import (
     incrementar_contador_sin_intencion,
     incrementar_contador_indecision,
     reiniciar_contador_indecision,
+    obtener_ultimo_pedido_agente,
 )
 
 logger = logging.getLogger("agentkit")
@@ -252,6 +253,7 @@ async def construir_system_prompt(
     cliente: dict | None,
     contador_sin_intencion: int = 0,
     contador_indecision: int = 0,
+    ultimo_pedido: dict | None = None,
 ) -> tuple[str, str, str]:
     """
     Arma el system prompt del turno en dos bloques, para aprovechar prompt caching
@@ -273,6 +275,8 @@ async def construir_system_prompt(
         contador_indecision: intercambios SEGUIDOS, hasta antes de este turno, en los que el
             cliente SÍ muestra intención de compra pero esquiva la pregunta de cierre que se
             le hizo (distinto de sin_intencion — ver marcar_indecision).
+        ultimo_pedido: último pedido del cliente hecho en una conversación ANTERIOR (ver
+            obtener_ultimo_pedido_previo). Se puede mencionar, pero nunca dar su estatus.
 
     Returns:
         (system_estable, system_volatil, telefono_sucursal) — telefono_sucursal es el
@@ -293,6 +297,8 @@ async def construir_system_prompt(
             "\n\n## Sabores disponibles (alitas y boneless)\n"
             + ", ".join(sabores)
             + "\nCuando un cliente pida alitas o boneless, pregunta el/los sabor(es) y cómo reparte las piezas."
+            "\nEsta lista es para validar el pedido: NO se la listes completa al cliente — si no conoce"
+            " los sabores, recuérdale que están en el menú de nuestro perfil de WhatsApp."
             "\nAl registrar el pedido, los productos de la sección 'Alitas y Boneless' DEBEN incluir el campo"
             " 'desglose' con cada porción {piezas, sabor}, usando EXACTAMENTE estos nombres de sabor y presentación."
         )
@@ -361,7 +367,7 @@ async def construir_system_prompt(
         " registra el primero). Su resultado te dice el conteo actualizado y si ya se bloqueó la"
         " conversación (al llegar a 3):"
         "\n- Si el conteo resultante es 1: NO menciones nada de strikes — en vez de eso, redirige"
-        " ACTIVAMENTE al cliente hacia una compra: pregúntale qué se le antoja, ofrécele el menú, o"
+        " ACTIVAMENTE al cliente hacia una compra: pregúntale qué se le antoja, recuérdale que el menú está en nuestro perfil de WhatsApp, o"
         " pregúntale en qué le puedes ayudar. El objetivo es darle una oportunidad clara de mostrar"
         " intención de compra antes de que un segundo mensaje sin intención cuente como strike visible."
         "\n- Si el conteo resultante es 2 y NO se bloqueó: avísale que se le aplicó un strike por"
@@ -401,7 +407,7 @@ async def construir_system_prompt(
         " real de cerrar — DEBES llamar marcar_indecision. Su resultado te dice el conteo"
         " actualizado y si ya toca dejar la conversación en stand-by (al llegar a 4)."
         "\n- Si tu último mensaje NO terminó en una pregunta de cierre (ej. es el inicio de la"
-        " plática, ya diste un folio y el cliente no pidió nada nuevo, o le compartiste el menú sin"
+        " plática, ya diste un folio y el cliente no pidió nada nuevo, o lo mandaste al menú del perfil sin"
         " pedirle nada todavía), NO llames marcar_indecision."
         "\n- Si el resultado indica en_stand_by=true: despídete con calidez, algo como \"Veo que"
         " seguimos platicando pero no hemos cerrado nada 😅 lo dejamos en pausa por ahora,"
@@ -415,8 +421,8 @@ async def construir_system_prompt(
         system_volatil += (
             "\n\n## PRIMER_MENSAJE_CONVERSACION"
             "\nEste es el PRIMER mensaje de esta conversación. Sigue estrictamente las reglas"
-            " de la sección 'Saludo inicial' e incluye al final de tu respuesta la recomendación"
-            " sobre las políticas de uso con su enlace."
+            " de la sección 'Saludo inicial' e incluye al final de tu respuesta el recordatorio"
+            " de leer las políticas de uso en nuestro perfil de WhatsApp (SIN ningún enlace)."
         )
 
     # Agregar contexto del cliente al system prompt si está registrado
@@ -442,6 +448,23 @@ async def construir_system_prompt(
         system_volatil += contexto_cliente
     else:
         system_volatil += "\n\n## Cliente actual\nEste cliente NO está registrado en Wings Kings. Atiéndelo con amabilidad, pero no asumas datos de dirección o preferencias previas."
+
+    # Último pedido de una conversación anterior (el historial solo trae la conversación
+    # actual — ver HISTORIAL_VENTANA_HORAS en memory.py). Se puede mencionar para que el
+    # cliente se sienta reconocido, pero el agente NO conoce su estado real.
+    if ultimo_pedido:
+        system_volatil += (
+            "\n\n## Último pedido del cliente (de una conversación anterior)"
+            f"\n- Folio #{ultimo_pedido['folio']}, del {ultimo_pedido['fecha_texto']},"
+            f" por ${ultimo_pedido['monto']:,.2f}"
+            "\nEste pedido es de una conversación ANTERIOR, no de la actual. Puedes mencionarlo"
+            " (folio y fecha) si el cliente pregunta por él o hace referencia a un pedido previo,"
+            " pero NUNCA des su estatus: no sabes si está en preparación, en camino, entregado o"
+            " cancelado, y NO debes suponerlo ni insinuarlo. Para cualquier detalle o seguimiento"
+            " de ese folio (o de cualquier pedido anterior), indícale que se comunique directamente"
+            f" a la sucursal al {telefono_sucursal}."
+            "\nNo lo menciones por iniciativa propia si el cliente solo viene a hacer un pedido nuevo."
+        )
 
     return system_estable, system_volatil, telefono_sucursal
 
@@ -525,6 +548,19 @@ MENSAJE_FOLIO_NO_VERIFICADO = (
 def extraer_folios_mencionados(texto: str) -> set[int]:
     """Extrae los números de folio que aparecen en un texto (patrón 'folio #NNNNN')."""
     return {int(m) for m in _PATRON_FOLIO.findall(texto or "")}
+
+
+async def obtener_ultimo_pedido_previo(cliente: dict | None, historial: list[dict]) -> dict | None:
+    """
+    Último pedido del cliente por WhatsApp, solo si es de una conversación ANTERIOR
+    (si su folio ya aparece en el historial actual, es de esta conversación y no aplica).
+    """
+    if not cliente or not cliente.get("id"):
+        return None
+    pedido = await obtener_ultimo_pedido_agente(cliente["id"])
+    if not pedido or pedido["folio"] in folios_conocidos_en_historial(historial):
+        return None
+    return pedido
 
 
 def folios_conocidos_en_historial(historial: list[dict]) -> set[int]:

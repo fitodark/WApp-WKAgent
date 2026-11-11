@@ -19,6 +19,7 @@ from agent.brain_common import (
     obtener_mensaje_error,
     obtener_mensaje_fallback,
     folios_conocidos_en_historial,
+    obtener_ultimo_pedido_previo,
     validar_folios_en_respuesta,
 )
 from agent.tools import (
@@ -126,8 +127,11 @@ async def generar_respuesta(
 
     contador_sin_intencion = await obtener_contador_sin_intencion(chat_id) if chat_id else 0
     contador_indecision = await obtener_contador_indecision(chat_id) if chat_id else 0
+    # Último pedido de una conversación anterior: se menciona en el prompt y su folio
+    # cuenta como "conocido" para que el candado de folios no bloquee la respuesta.
+    ultimo_pedido = await obtener_ultimo_pedido_previo(cliente, historial)
     system_estable, system_volatil, _telefono_sucursal = await construir_system_prompt(
-        historial, cliente, contador_sin_intencion, contador_indecision
+        historial, cliente, contador_sin_intencion, contador_indecision, ultimo_pedido
     )
 
     mensajes = []
@@ -177,6 +181,8 @@ async def generar_respuesta(
                     )
                 texto = texto_extraido or obtener_mensaje_error()
                 folios_previos = folios_conocidos_en_historial(historial)
+                if ultimo_pedido:
+                    folios_previos.add(ultimo_pedido["folio"])
                 texto = validar_folios_en_respuesta(texto, folios_reales_turno, folios_previos)
                 return texto, (adjuntos[-1] if adjuntos else None)
 

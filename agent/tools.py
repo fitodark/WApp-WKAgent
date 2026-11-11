@@ -90,6 +90,51 @@ async def buscar_cliente_por_telefono(telefono: str) -> dict | None:
         return None
 
 
+_MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+
+
+async def obtener_ultimo_pedido_agente(client_id: int) -> dict | None:
+    """
+    Último pedido que este cliente hizo por WhatsApp (venta_agente=1).
+
+    Solo se usa para que el agente pueda MENCIONARLO (folio, fecha, monto) cuando el
+    cliente vuelve a escribir en otra conversación — NUNCA para dar su estatus: el
+    agente no sabe si ya se entregó o se canceló (eso lo ve la sucursal).
+
+    Returns:
+        {"folio", "fecha_texto", "monto"} o None si no tiene pedidos / hay error.
+    """
+    if not client_id:
+        return None
+    try:
+        conn = await aiomysql.connect(**_db_config())
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT ventaId, montoTotal, created_at FROM ventas "
+                "WHERE client_id = %s AND venta_agente = 1 "
+                "ORDER BY ventaId DESC LIMIT 1",
+                (client_id,),
+            )
+            row = await cur.fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error al consultar último pedido del cliente {client_id}: {e}")
+        return None
+    if not row:
+        return None
+    creado = row["created_at"]
+    fecha_texto = (
+        f"{_DIAS[creado.weekday()].lower()} {creado.day} de {_MESES[creado.month - 1]}"
+        if creado else "fecha no disponible"
+    )
+    return {
+        "folio": int(row["ventaId"]),
+        "fecha_texto": fecha_texto,
+        "monto": float(row["montoTotal"] or 0),
+    }
+
+
 async def guardar_ubicacion_cliente(telefono: str, lat: float, lng: float) -> bool:
     """
     Guarda la última ubicación (lat/lng) que el cliente compartió por WhatsApp, si ya
